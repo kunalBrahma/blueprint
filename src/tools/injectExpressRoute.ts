@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -333,134 +334,138 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
 
     execute: async (args) => {
         const { targetFile, method, routePath, dryRun, serverFile, mountPath, routerImportName } = args;
-
-        // Fix 3: sanitize handler body to remove JSON-escaped quotes
-        const handlerBody = sanitizeHandlerBody(args.handlerBody);
-
-        // ── Validate target file ───────────────────────────────────────────────
         const resolvedPath = path.resolve(targetFile);
+        const projectRoot = path.resolve(resolvedPath, "../../..");
 
-        if (!fs.existsSync(resolvedPath)) {
-            return `[ERROR] Error: File not found: "${resolvedPath}"`;
-        }
+        return withMutationReport("inject_express_route", dryRun ? null : projectRoot, async (report) => {
+            // Fix 3: sanitize handler body to remove JSON-escaped quotes
+            const handlerBody = sanitizeHandlerBody(args.handlerBody);
 
-        const ext = path.extname(resolvedPath);
-        if (!([".ts", ".js"].includes(ext))) {
-            return `[ERROR] Error: Target file must be a .ts or .js file. Got: "${ext}"`;
-        }
-
-        // ── Validate serverFile if provided ───────────────────────────────────
-        let resolvedServerPath: string | undefined;
-        if (serverFile) {
-            if (!mountPath) {
-                return `[ERROR] Error: "mountPath" is required when "serverFile" is provided.`;
+            // ── Validate target file ───────────────────────────────────────────────
+            if (!fs.existsSync(resolvedPath)) {
+                throw new Error(`File not found: "${resolvedPath}"`);
             }
-            resolvedServerPath = path.resolve(serverFile);
-            if (!fs.existsSync(resolvedServerPath)) {
-                return `[ERROR] Error: serverFile not found: "${resolvedServerPath}"`;
+
+            const ext = path.extname(resolvedPath);
+            if (!([".ts", ".js"].includes(ext))) {
+                throw new Error(`Target file must be a .ts or .js file. Got: "${ext}"`);
             }
-        }
 
-        // ── Read router file ───────────────────────────────────────────────────
-        let originalContent: string;
-        try {
-            originalContent = fs.readFileSync(resolvedPath, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error reading file: ${msg}`;
-        }
-
-        // ── Inject route ───────────────────────────────────────────────────────
-        let modifiedContent: string;
-        try {
-            modifiedContent = injectRoute(
-                originalContent,
-                resolvedPath,
-                method,
-                routePath,
-                handlerBody
-            );
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] AST Injection Error: ${msg}`;
-        }
-
-        // ── Wire into server.ts (if requested) ────────────────────────────────
-        let modifiedServerContent: string | undefined;
-        let resolvedServerContent: string | undefined;
-
-        if (resolvedServerPath && mountPath) {
-            const importName =
-                routerImportName ?? deriveImportName(resolvedPath);
-
-            try {
-                resolvedServerContent = fs.readFileSync(resolvedServerPath, "utf-8");
-                const warnings: string[] = [];
-                modifiedServerContent = wireRouteIntoServer(
-                    resolvedServerContent,
-                    resolvedServerPath,
-                    resolvedPath,
-                    mountPath,
-                    importName,
-                    warnings
-                );
-                // attach warnings to modifiedServerContent as a header comment so callers see them in dry runs
-                if (warnings.length > 0) {
-                    const header = warnings.map(w => `/* ${w} */`).join("\n") + "\n\n";
-                    modifiedServerContent = header + modifiedServerContent;
+            // ── Validate serverFile if provided ───────────────────────────────────
+            let resolvedServerPath: string | undefined;
+            if (serverFile) {
+                if (!mountPath) {
+                    throw new Error(`"mountPath" is required when "serverFile" is provided.`);
                 }
-            } catch (err: unknown) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return `[ERROR] Error processing server.ts: ${msg}`;
+                resolvedServerPath = path.resolve(serverFile);
+                if (!fs.existsSync(resolvedServerPath)) {
+                    throw new Error(`serverFile not found: "${resolvedServerPath}"`);
+                }
             }
-        }
 
-        // ── Dry run ───────────────────────────────────────────────────────────
-        if (dryRun) {
-            const sep = "─".repeat(60);
-            let output =
-                `[INFO] DRY RUN — No files were written.\n` +
-                `Router file: ${resolvedPath}\n` +
-                `Route:       ${method.toUpperCase()} ${routePath}\n\n` +
-                `${sep}\nPROPOSED ROUTER FILE:\n${sep}\n` +
-                modifiedContent +
-                `\n${sep}`;
-
-            if (modifiedServerContent) {
-                output +=
-                    `\n\n${sep}\nPROPOSED SERVER.TS:\n${sep}\n` +
-                    modifiedServerContent +
-                    `\n${sep}`;
-            }
-            return output;
-        }
-
-        // ── Write to disk ──────────────────────────────────────────────────────
-        try {
-            fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error writing router file: ${msg}`;
-        }
-
-        let serverResult = "";
-        if (resolvedServerPath && modifiedServerContent) {
+            // ── Read router file ───────────────────────────────────────────────────
+            let originalContent: string;
             try {
-                fs.writeFileSync(resolvedServerPath, modifiedServerContent, "utf-8");
-                serverResult = `\n[SUCCESS] server.ts updated: app.use("${mountPath}", ...) added.`;
+                originalContent = fs.readFileSync(resolvedPath, "utf-8");
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
-                serverResult = `\n[WARNING] Route injected but server.ts update failed: ${msg}`;
+                throw new Error(`Error reading file: ${msg}`);
             }
-        }
 
-        return (
-            `[SUCCESS] Route injected successfully.\n\n` +
-            `File:   ${resolvedPath}\n` +
-            `Route:  ${method.toUpperCase()} ${routePath}` +
-            serverResult +
-            `\n\nThe handler was inserted after the last existing router.${method}() call ` +
-            `(or before the export if none existed).`
-        );
+            // ── Inject route ───────────────────────────────────────────────────────
+            let modifiedContent: string;
+            try {
+                modifiedContent = injectRoute(
+                    originalContent,
+                    resolvedPath,
+                    method,
+                    routePath,
+                    handlerBody
+                );
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(`AST Injection Error: ${msg}`);
+            }
+
+            // ── Wire into server.ts (if requested) ────────────────────────────────
+            let modifiedServerContent: string | undefined;
+
+            if (resolvedServerPath && mountPath) {
+                const importName =
+                    routerImportName ?? deriveImportName(resolvedPath);
+
+                try {
+                    const resolvedServerContent = fs.readFileSync(resolvedServerPath, "utf-8");
+                    const warnings: string[] = [];
+                    modifiedServerContent = wireRouteIntoServer(
+                        resolvedServerContent,
+                        resolvedServerPath,
+                        resolvedPath,
+                        mountPath,
+                        importName,
+                        warnings
+                    );
+                    // attach warnings to modifiedServerContent as a header comment so callers see them in dry runs
+                    if (warnings.length > 0) {
+                        const header = warnings.map(w => `/* ${w} */`).join("\n") + "\n\n";
+                        modifiedServerContent = header + modifiedServerContent;
+                    }
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    throw new Error(`Error processing server.ts: ${msg}`);
+                }
+            }
+
+            // ── Dry run ───────────────────────────────────────────────────────────
+            if (dryRun) {
+                const sep = "─".repeat(60);
+                let output =
+                    `[INFO] DRY RUN — No files were written.\n` +
+                    `Router file: ${resolvedPath}\n` +
+                    `Route:       ${method.toUpperCase()} ${routePath}\n\n` +
+                    `${sep}\nPROPOSED ROUTER FILE:\n${sep}\n` +
+                    modifiedContent +
+                    `\n${sep}`;
+
+                if (modifiedServerContent) {
+                    output +=
+                        `\n\n${sep}\nPROPOSED SERVER.TS:\n${sep}\n` +
+                        modifiedServerContent +
+                        `\n${sep}`;
+                }
+                report.humanMessage = output;
+                return;
+            }
+
+            // ── Write to disk ──────────────────────────────────────────────────────
+            try {
+                fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
+                report.mutatedFiles.push(resolvedPath);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(`Error writing router file: ${msg}`);
+            }
+
+            let serverResult = "";
+            if (resolvedServerPath && modifiedServerContent) {
+                try {
+                    fs.writeFileSync(resolvedServerPath, modifiedServerContent, "utf-8");
+                    report.mutatedFiles.push(resolvedServerPath);
+                    serverResult = `\n[SUCCESS] server.ts updated: app.use("${mountPath}", ...) added.`;
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    serverResult = `\n[WARNING] Route injected but server.ts update failed: ${msg}`;
+                    report.status = "PARTIAL_FAILURE";
+                }
+            }
+
+            report.humanMessage =
+                `[SUCCESS] Route injected successfully.\n\n` +
+                `File:   ${resolvedPath}\n` +
+                `Route:  ${method.toUpperCase()} ${routePath}` +
+                serverResult +
+                `\n\nThe handler was inserted after the last existing router.${method}() call ` +
+                `(or before the export if none existed).`;
+        });
     },
 };

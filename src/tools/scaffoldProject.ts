@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import util from "node:util";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const execAsync = util.promisify(exec);
 
@@ -30,19 +31,20 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
         const { projectName, outputDir, installDeps } = args;
         const projectPath = path.join(outputDir, projectName);
 
-        // Validate output dir exists
-        if (!fs.existsSync(outputDir)) {
-            return `Error: Output directory does not exist: ${outputDir}`;
-        }
+        return withMutationReport("scaffold_project", projectPath, async (report) => {
+            // Validate output dir exists
+            if (!fs.existsSync(outputDir)) {
+                throw new Error(`Output directory does not exist: ${outputDir}`);
+            }
 
-        // Check if project already exists
-        if (fs.existsSync(projectPath)) {
-            return `Error: Directory already exists: ${projectPath}`;
-        }
+            // Check if project already exists
+            if (fs.existsSync(projectPath)) {
+                throw new Error(`Directory already exists: ${projectPath}`);
+            }
 
-        try {
             // Step 1: Create the target directory so 'cwd' has a valid path
             fs.mkdirSync(projectPath, { recursive: true });
+            report.mutatedFiles.push(projectPath);
 
             // Step 2: Clone the boilerplate DIRECTLY into the new folder using "."
             await execAsync(`git clone https://github.com/kunalBrahma/backend-boilerplate.git .`, {
@@ -65,19 +67,11 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
                 } catch (err: unknown) {
                     const errorMessage = err instanceof Error ? err.message : String(err);
                     installOutput = `\n[WARNING] NPM installation failed. Run \`npm install\` manually. Error: ${errorMessage}`;
+                    report.status = "PARTIAL_FAILURE";
                 }
             }
 
-            return `[SUCCESS] Project "${projectName}" scaffolded successfully at ${projectPath} using Kunal's backend-boilerplate.${installOutput}
-
-Next steps:
-  1. cd ${projectPath}
-  2. Add your DATABASE_URL to the .env file
-  3. Run your Prisma migrations`;
-
-        } catch (error: unknown) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return `Failed to scaffold project: ${errorMessage}`;
-        }
+            report.humanMessage = `[SUCCESS] Project "${projectName}" scaffolded successfully at ${projectPath} using Kunal's backend-boilerplate.${installOutput}\n\nNext steps:\n  1. cd ${projectPath}\n  2. Add your DATABASE_URL to the .env file\n  3. Run your Prisma migrations`;
+        });
     },
 };

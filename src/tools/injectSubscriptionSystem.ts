@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectSubscriptionSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -12,7 +13,7 @@ const injectSubscriptionSchema = z.object({
 
 type InjectSubscriptionParams = typeof injectSubscriptionSchema;
 
-function updatePrismaSchema(targetSrcDirectory: string): string {
+function updatePrismaSchema(targetSrcDirectory: string, report: { mutatedFiles: string[] }): string {
   const schemaPath = path.resolve(targetSrcDirectory, "../prisma/schema.prisma");
   if (!fs.existsSync(schemaPath)) {
     return "[WARNING] schema.prisma not found. Skipping DB sync.";
@@ -20,20 +21,18 @@ function updatePrismaSchema(targetSrcDirectory: string): string {
 
   let schemaContent = fs.readFileSync(schemaPath, "utf-8");
 
-  // Modify User model
   if (schemaContent.includes("model User")) {
-    const userBlockRegex = /(model\\s+User\\s+\\{[^}]*?)(\\n\\})/;
+    const userBlockRegex = /(model\s+User\s+\{[^}]*?)(\n\})/;
     const match = schemaContent.match(userBlockRegex);
     if (match && !schemaContent.includes("isPro")) {
       const newFields = `
   isPro               Boolean   @default(false)
   gatewayCustomerId   String?
   subscriptions       Subscription[]`;
-      schemaContent = schemaContent.replace(userBlockRegex, `\$1\${newFields}\$2`);
+      schemaContent = schemaContent.replace(userBlockRegex, `$1${newFields}$2`);
     }
   }
 
-  // Add Plan and Subscription models
   if (!schemaContent.includes("model Plan")) {
     schemaContent += `
 model Plan {
@@ -63,12 +62,13 @@ model Subscription {
   }
 
   fs.writeFileSync(schemaPath, schemaContent, "utf-8");
+  report.mutatedFiles.push(schemaPath);
 
   try {
     execSync("npx prisma generate", { stdio: "inherit", cwd: path.resolve(targetSrcDirectory, "..") });
     return "[SUCCESS] Prisma schema updated and client generated.";
   } catch (err: unknown) {
-    return `[WARNING] Prisma schema updated but 'npx prisma generate' failed: \${err}`;
+    return `[WARNING] Prisma schema updated but 'npx prisma generate' failed: ${err}`;
   }
 }
 
@@ -76,7 +76,6 @@ function buildStrategyInterfaces(): Map<string, string> {
   const files = new Map<string, string>();
   const project = new Project({ useInMemoryFileSystem: true });
 
-  // 1. Interface
   const interfaceFile = project.createSourceFile("subscription.interface.ts", `
 export interface ISubscriptionProvider {
   createCustomer(email: string, name: string): Promise<string>;
@@ -85,7 +84,6 @@ export interface ISubscriptionProvider {
 }
 `.trimStart());
 
-  // 2. Stripe Provider
   const stripeFile = project.createSourceFile("stripe.provider.ts", `
 import Stripe from "stripe";
 import { env } from "../../config/env";
@@ -135,7 +133,6 @@ export class StripeProvider implements ISubscriptionProvider {
 }
 `.trimStart());
 
-  // 3. Razorpay Provider
   const razorpayFile = project.createSourceFile("razorpay.provider.ts", `
 import Razorpay from "razorpay";
 import { env } from "../../config/env";
@@ -181,7 +178,6 @@ export class RazorpayProvider implements ISubscriptionProvider {
 }
 `.trimStart());
 
-  // 4. Factory Service
   const serviceFile = project.createSourceFile("subscription.service.ts", `
 import { env } from "../../config/env";
 import { ISubscriptionProvider } from "./subscription.interface";
@@ -230,26 +226,31 @@ export const injectSubscriptionSystem: Tool<FastMCPSessionAuth, InjectSubscripti
 
   execute: async (args) => {
     const { targetSrcDirectory, dryRun } = args;
+    const projectRoot = path.resolve(targetSrcDirectory, "..");
 
-    if (dryRun) {
-      return `[INFO] DRY RUN: Will mutate schema.prisma and generate Strategy Providers in src/services/subscription/`;
-    }
+    return withMutationReport("inject_subscription_system", dryRun ? null : projectRoot, async (report) => {
+      if (dryRun) {
+        report.humanMessage = `[INFO] DRY RUN: Will mutate schema.prisma and generate Strategy Providers in src/services/subscription/`;
+        return;
+      }
 
-    const dbResult = updatePrismaSchema(targetSrcDirectory);
+      const dbResult = updatePrismaSchema(targetSrcDirectory, report);
 
-    const subscriptionDir = path.resolve(targetSrcDirectory, "services", "subscription");
-    if (!fs.existsSync(subscriptionDir)) {
-      fs.mkdirSync(subscriptionDir, { recursive: true });
-    }
+      const subscriptionDir = path.resolve(targetSrcDirectory, "services", "subscription");
+      if (!fs.existsSync(subscriptionDir)) {
+        fs.mkdirSync(subscriptionDir, { recursive: true });
+      }
 
-    const files = buildStrategyInterfaces();
-    let fileResult = "";
-    for (const [name, content] of files.entries()) {
-      const filePath = path.join(subscriptionDir, name);
-      fs.writeFileSync(filePath, content, "utf-8");
-      fileResult += `\\nCreated \${name}`;
-    }
+      const files = buildStrategyInterfaces();
+      let fileResult = "";
+      for (const [name, content] of files.entries()) {
+        const filePath = path.join(subscriptionDir, name);
+        fs.writeFileSync(filePath, content, "utf-8");
+        report.mutatedFiles.push(filePath);
+        fileResult += `\nCreated ${name}`;
+      }
 
-    return `[SUCCESS] Unified Subscription System injected.\\n\${dbResult}\${fileResult}`;
+      report.humanMessage = `[SUCCESS] Unified Subscription System injected.\n${dbResult}${fileResult}`;
+    });
   },
 };

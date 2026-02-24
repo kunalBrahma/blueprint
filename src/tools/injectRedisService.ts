@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectRedisSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -47,42 +49,42 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
 
   execute: async (args) => {
     const { targetSrcDirectory, dryRun } = args;
+    const projectRoot = path.resolve(targetSrcDirectory, "..");
 
-    const servicesDir = path.resolve(targetSrcDirectory, "services");
-    if (!fs.existsSync(servicesDir)) {
-      fs.mkdirSync(servicesDir, { recursive: true });
-    }
+    return withMutationReport("inject_redis_service", dryRun ? null : projectRoot, async (report) => {
+      const servicesDir = path.resolve(targetSrcDirectory, "services");
+      if (!fs.existsSync(servicesDir)) {
+        fs.mkdirSync(servicesDir, { recursive: true });
+      }
 
-    const filePath = path.join(servicesDir, "redis.service.ts");
-    if (fs.existsSync(filePath)) {
-      return `[ERROR] Error: File already exists: "\${filePath}".`;
-    }
+      const filePath = path.join(servicesDir, "redis.service.ts");
+      if (fs.existsSync(filePath)) {
+        throw new Error(`File already exists: "${filePath}".`);
+      }
 
-    const content = buildRedisService();
+      const content = buildRedisService();
 
       if (dryRun) {
         const sep = "─".repeat(60);
-        return `[INFO] DRY RUN\\n\${sep}\\n\${content}\\n\${sep}`;
-    }
-
-    try {
-      fs.writeFileSync(filePath, content, "utf-8");
-    } catch (err: unknown) {
-      return `[ERROR] Error writing file: \${err}`;
-    }
-
-    let packageWarnings = "\\n\\n[SUCCESS] Packages automatically installed:\\n  ioredis express-rate-limit rate-limit-redis";
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(targetSrcDirectory, "..");
-      if (fs.existsSync(path.join(cwd, "package.json"))) {
-        console.log("\\n[INFO] Auto-installing dependencies for Redis service...");
-        execSync("npm install ioredis express-rate-limit rate-limit-redis --no-save --save-exact", { cwd, stdio: "inherit" });
+        report.humanMessage = `[INFO] DRY RUN\n${sep}\n${content}\n${sep}`;
+        return;
       }
-    } catch (err: unknown) {
-      packageWarnings = "\\n\\n[WARNING] Failed to auto-install packages. Please manually run:\\n  npm install ioredis express-rate-limit rate-limit-redis";
-    }
 
-    return `[SUCCESS] Redis Service injected successfully!\\nFile: \${filePath}\${packageWarnings}`;
+      fs.writeFileSync(filePath, content, "utf-8");
+      report.mutatedFiles.push(filePath);
+
+      let packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n  ioredis express-rate-limit rate-limit-redis";
+      try {
+        const cwd = projectRoot;
+        if (fs.existsSync(path.join(cwd, "package.json"))) {
+          execSync("npm install ioredis express-rate-limit rate-limit-redis --no-save --save-exact", { cwd, stdio: "inherit" });
+        }
+      } catch (err: unknown) {
+        packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install ioredis express-rate-limit rate-limit-redis";
+        report.status = "PARTIAL_FAILURE";
+      }
+
+      report.humanMessage = `[SUCCESS] Redis Service injected successfully!\nFile: ${filePath}${packageWarnings}`;
+    });
   },
 };

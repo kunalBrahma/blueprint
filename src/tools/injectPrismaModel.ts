@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { z } from "zod";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -94,16 +95,8 @@ function idDefault(type: (typeof PRISMA_SCALAR_TYPES)[number]): string {
 
 /**
  * Format an array of field definitions into aligned Prisma model block lines.
- *
- * Output example:
- *   id         Int       @id @default(autoincrement())
- *   title      String
- *   authorId   Int
- *   publishedAt DateTime? @unique
  */
 function formatFields(fields: FieldDef[]): string[] {
-    // Pre-compute the display strings for name and type columns so we can
-    // measure the maximum width of each before building the aligned output.
     const rows = fields.map((f) => {
         const nameCol = f.name;
         const typeStr = f.isOptional ? `${f.type}?` : f.type;
@@ -116,7 +109,6 @@ function formatFields(fields: FieldDef[]): string[] {
             attributes.push("@unique");
         }
         if (f.relation) {
-            // Derive the FK field name by convention: <name>Id
             const fkField = `${f.name}Id`;
             attributes.push(`@relation(fields: [${fkField}], references: [id])`);
         }
@@ -127,7 +119,6 @@ function formatFields(fields: FieldDef[]): string[] {
     const maxName = Math.max(...rows.map((r) => r.nameCol.length));
     const maxType = Math.max(...rows.map((r) => r.typeStr.length));
 
-    // Ensure at least 2-space gap between columns
     const nameWidth = maxName + 2;
     const typeWidth = maxType + 2;
 
@@ -174,76 +165,113 @@ export const injectPrismaModel: Tool<
 
     execute: async (args) => {
         const { schemaPath, modelName, fields, dryRun } = args;
-
-        // ── Validate schemaPath ────────────────────────────────────────────────
         const resolvedPath = path.resolve(schemaPath);
+        const projectRoot = path.dirname(path.dirname(resolvedPath));
 
-        if (!fs.existsSync(resolvedPath)) {
-            return `[ERROR] Error: File not found: "${resolvedPath}"`;
-        }
-
-        if (path.extname(resolvedPath) !== ".prisma") {
-            return `[ERROR] Error: Expected a .prisma file, got: "${path.extname(resolvedPath)}"`;
-        }
-
-        // ── Read current schema ────────────────────────────────────────────────
-        let currentContent: string;
-        try {
-            currentContent = fs.readFileSync(resolvedPath, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error reading file: ${msg}`;
-        }
-
-        // ── Duplicate model guard ──────────────────────────────────────────────
-        // Matches:  model User {  (with any surrounding whitespace)
-        const duplicatePattern = new RegExp(
-            `^\\s*model\\s+${modelName}\\s*\\{`,
-            "m"
-        );
-        if (duplicatePattern.test(currentContent)) {
-            return (
-                `[ERROR] Duplicate model detected: A model named "${modelName}" already exists in "${resolvedPath}". ` +
-                `Remove or rename it before injecting a new one.`
-            );
-        }
-
-        // ── Normalize fields: enforce camelCase, remove double Id, and infer relations ───
-        const normalizedFields: FieldDef[] = fields.map((f) => {
-            // Normalize name: snake_case -> camelCase
-            let name = toCamelCase(f.name);
-            // Fix accidental IdId duplicates
-            name = name.replace(/IdId$/i, "Id");
-
-            // Ensure camelCase first letter
-            name = name.charAt(0).toLowerCase() + name.slice(1);
-
-            // If relation not explicitly provided, infer from name ending with Id
-            let relation = f.relation;
-            if (!relation && /Id$/i.test(name)) {
-                const base = name.slice(0, -2); // remove 'Id'
-                relation = base.charAt(0).toUpperCase() + base.slice(1);
+        return withMutationReport("inject_prisma_model", dryRun ? null : projectRoot, async (report) => {
+            // ── Validate schemaPath ────────────────────────────────────────────────
+            if (!fs.existsSync(resolvedPath)) {
+                throw new Error(`File not found: "${resolvedPath}"`);
             }
 
-            return { ...f, name, relation } as FieldDef;
-        });
+            if (path.extname(resolvedPath) !== ".prisma") {
+                throw new Error(`Expected a .prisma file, got: "${path.extname(resolvedPath)}"`);
+            }
 
-        // ── Build model block ──────────────────────────────────────────────────
-        const modelBlock = buildModelBlock(modelName, normalizedFields);
+            // ── Read current schema ────────────────────────────────────────────────
+            let currentContent: string;
+            try {
+                currentContent = fs.readFileSync(resolvedPath, "utf-8");
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(`Error reading file: ${msg}`);
+            }
 
-        // ── Prepare warnings array early so dry-run can surface them too ───────
-        const warnings: string[] = [];
+            // ── Duplicate model guard ──────────────────────────────────────────────
+            const duplicatePattern = new RegExp(
+                `^\\s*model\\s+${modelName}\\s*\\{`,
+                "m"
+            );
+            if (duplicatePattern.test(currentContent)) {
+                throw new Error(
+                    `Duplicate model detected: A model named "${modelName}" already exists in "${resolvedPath}". ` +
+                    `Remove or rename it before injecting a new one.`
+                );
+            }
 
-        // ── Dry run ────────────────────────────────────────────────────────────
-        if (dryRun) {
-            // Simulate inverse-relation detection to surface warnings in dry-run
-            const sepSchema = currentContent.trimEnd() + "\n\n" + modelBlock + "\n";
-            let simSchema = sepSchema;
+            // ── Normalize fields ───────────────────────────────────────────────────
+            const normalizedFields: FieldDef[] = fields.map((f) => {
+                let name = toCamelCase(f.name);
+                name = name.replace(/IdId$/i, "Id");
+                name = name.charAt(0).toLowerCase() + name.slice(1);
+
+                let relation = f.relation;
+                if (!relation && /Id$/i.test(name)) {
+                    const base = name.slice(0, -2);
+                    relation = base.charAt(0).toUpperCase() + base.slice(1);
+                }
+
+                return { ...f, name, relation } as FieldDef;
+            });
+
+            // ── Build model block ──────────────────────────────────────────────────
+            const modelBlock = buildModelBlock(modelName, normalizedFields);
+
+            // ── Prepare warnings array ───────────────────────────────────────────────
+            const warnings: string[] = [];
+
+            // ── Dry run ────────────────────────────────────────────────────────────
+            if (dryRun) {
+                const sepSchema = currentContent.trimEnd() + "\n\n" + modelBlock + "\n";
+                let simSchema = sepSchema;
+                for (const f of normalizedFields) {
+                    if (!f.relation) continue;
+                    const parentModel = f.relation;
+                    const modelRegex = new RegExp(`model\\s+${parentModel}\\s+\\{([\\s\\S]*?)\\n\\}`, "m");
+                    const match = simSchema.match(modelRegex);
+                    if (!match) {
+                        warnings.push(`[WARNING] Referenced model '${parentModel}' not found in schema.prisma. Skipping inverse relation injection.`);
+                        continue;
+                    }
+
+                    const parentBlock = match[0];
+                    const inverseBase = lowerFirst(modelName);
+                    let inverseName = toPlural(inverseBase);
+                    const fieldExists = new RegExp(`^\\s*${inverseName}\\s`, "m").test(parentBlock);
+                    if (fieldExists) {
+                        const alt = `${inverseName}_injected`;
+                        warnings.push(`[WARNING] Field name collision on parent model '${parentModel}': '${inverseName}' already exists. Using '${alt}' instead.`);
+                    }
+                }
+
+                const separator = "─".repeat(60);
+                const warningText = warnings.length ? `\nWARNINGS:\n${warnings.join("\n")}\n\n` : "";
+                report.humanMessage =
+                    `[INFO] DRY RUN — No file was written.\n` +
+                    `Schema: ${resolvedPath}\n` +
+                    `Model:  ${modelName} (${fields.length} field${fields.length === 1 ? "" : "s"})\n` +
+                    `${warningText}\n` +
+                    `${separator}\n` +
+                    `PROPOSED MODEL BLOCK:\n` +
+                    `${separator}\n` +
+                    modelBlock +
+                    `\n${separator}`;
+                return;
+            }
+
+            // ── Append to schema file and inject inverse relations ──────────────────
+            const trimmed = currentContent.trimEnd();
+            const backup = currentContent;
+
+            let newContent = `${trimmed}\n\n${modelBlock}\n`;
+
+            let modifiedSchema = newContent;
+
             for (const f of normalizedFields) {
                 if (!f.relation) continue;
                 const parentModel = f.relation;
                 const modelRegex = new RegExp(`model\\s+${parentModel}\\s+\\{([\\s\\S]*?)\\n\\}`, "m");
-                const match = simSchema.match(modelRegex);
+                const match = modifiedSchema.match(modelRegex);
                 if (!match) {
                     warnings.push(`[WARNING] Referenced model '${parentModel}' not found in schema.prisma. Skipping inverse relation injection.`);
                     continue;
@@ -252,117 +280,60 @@ export const injectPrismaModel: Tool<
                 const parentBlock = match[0];
                 const inverseBase = lowerFirst(modelName);
                 let inverseName = toPlural(inverseBase);
+
                 const fieldExists = new RegExp(`^\\s*${inverseName}\\s`, "m").test(parentBlock);
                 if (fieldExists) {
                     const alt = `${inverseName}_injected`;
                     warnings.push(`[WARNING] Field name collision on parent model '${parentModel}': '${inverseName}' already exists. Using '${alt}' instead.`);
+                    inverseName = alt;
                 }
+
+                const inverseLine = `  ${inverseName} ${modelName}[]`;
+                const newParentBlock = parentBlock.replace(/\n\}$/, `\n${inverseLine}\n}`);
+                modifiedSchema = modifiedSchema.replace(parentBlock, newParentBlock);
             }
 
-            const separator = "─".repeat(60);
-            const warningText = warnings.length ? `\nWARNINGS:\n${warnings.join("\n")}\n\n` : "";
-            return (
-                `[INFO] DRY RUN — No file was written.\n` +
-                `Schema: ${resolvedPath}\n` +
-                `Model:  ${modelName} (${fields.length} field${fields.length === 1 ? "" : "s"})\n` +
-                `${warningText}\n` +
-                `${separator}\n` +
-                `PROPOSED MODEL BLOCK:\n` +
-                `${separator}\n` +
-                modelBlock +
-                `\n${separator}`
-            );
-        }
-
-        // ── Append to schema file and attempt to inject inverse relations ──────
-        const trimmed = currentContent.trimEnd();
-        // Backup original for atomic rollback
-        const backup = currentContent;
-
-        // Insert model block
-        let newContent = `${trimmed}\n\n${modelBlock}\n`;
-
-        // For each normalized field that references a parent model, inject inverse relation
-        const schemaText = newContent; // start from content with child model appended
-        let modifiedSchema = schemaText;
-
-        for (const f of normalizedFields) {
-            if (!f.relation) continue;
-            const parentModel = f.relation;
-            // Find parent model block
-            const modelRegex = new RegExp(`model\\s+${parentModel}\\s+\\{([\\s\\S]*?)\\n\\}`, "m");
-            const match = modifiedSchema.match(modelRegex);
-            if (!match) {
-                warnings.push(`[WARNING] Referenced model '${parentModel}' not found in schema.prisma. Skipping inverse relation injection.`);
-                continue;
-            }
-
-            const parentBlock = match[0];
-            // Compute inverse field name: plural of child model in camelCase
-            const inverseBase = lowerFirst(modelName);
-            let inverseName = toPlural(inverseBase);
-
-            // Check for collisions in parent block
-            const fieldExists = new RegExp(`^\\s*${inverseName}\\s`, "m").test(parentBlock);
-            if (fieldExists) {
-                // Avoid overwrite; append suffix
-                const alt = `${inverseName}_injected`;
-                warnings.push(`[WARNING] Field name collision on parent model '${parentModel}': '${inverseName}' already exists. Using '${alt}' instead.`);
-                inverseName = alt;
-            }
-
-            // Build inverse line
-            const inverseLine = `  ${inverseName} ${modelName}[]`;
-
-            // Insert inverse line before closing brace of parentBlock
-            const newParentBlock = parentBlock.replace(/\n\}$/, `\n${inverseLine}\n}`);
-
-            // Replace in modifiedSchema
-            modifiedSchema = modifiedSchema.replace(parentBlock, newParentBlock);
-        }
-
-        try {
-            fs.writeFileSync(resolvedPath, modifiedSchema, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error writing file: ${msg}`;
-        }
-
-        let prismaWarning = "";
-        try {
-            const projectRoot = path.dirname(path.dirname(resolvedPath));
-            execSync("npx prisma generate", { stdio: "inherit", cwd: projectRoot });
-        } catch (err) {
-            // Atomic rollback
             try {
-                fs.writeFileSync(resolvedPath, backup, "utf-8");
-            } catch (_rollbackErr) {
-                // If rollback fails, surface both errors
-                return `[ERROR] Failed to run 'npx prisma generate' and rollback failed. Manual intervention required.`;
+                fs.writeFileSync(resolvedPath, modifiedSchema, "utf-8");
+                report.mutatedFiles.push(resolvedPath);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(`Error writing file: ${msg}`);
             }
-            prismaWarning = "\n[ERROR] Prisma generate failed; schema.prisma reverted to previous state.";
-            return (`[ERROR] Prisma generate failed; schema.prisma was reverted.\n` + String(err));
-        }
 
-        const fieldSummary = normalizedFields
-            .map((f) => {
-                const parts = [`${f.name}: ${f.type}${f.isOptional ? "?" : ""}`];
-                if (f.isId) parts.push("@id");
-                if (f.isUnique) parts.push("@unique");
-                if (f.relation) parts.push(`@relation(→ ${f.relation})`);
-                return `  • ${parts.join(" ")}`;
-            })
-            .join("\n");
+            let prismaWarning = "";
+            try {
+                execSync("npx prisma generate", { stdio: "inherit", cwd: projectRoot });
+            } catch (err) {
+                // Atomic rollback
+                try {
+                    fs.writeFileSync(resolvedPath, backup, "utf-8");
+                } catch (_rollbackErr) {
+                    throw new Error("Failed to run 'npx prisma generate' and rollback failed. Manual intervention required.");
+                }
+                prismaWarning = "\n[ERROR] Prisma generate failed; schema.prisma reverted to previous state.";
+                throw new Error(`Prisma generate failed; schema.prisma was reverted.\n${String(err)}`);
+            }
 
-        const warningsText = warnings.length ? `\n${warnings.join("\n")}` : "";
+            const fieldSummary = normalizedFields
+                .map((f) => {
+                    const parts = [`${f.name}: ${f.type}${f.isOptional ? "?" : ""}`];
+                    if (f.isId) parts.push("@id");
+                    if (f.isUnique) parts.push("@unique");
+                    if (f.relation) parts.push(`@relation(→ ${f.relation})`);
+                    return `  • ${parts.join(" ")}`;
+                })
+                .join("\n");
 
-        return (
-            `[SUCCESS] Model "${modelName}" successfully appended to:\n` +
-            `   ${resolvedPath}\n\n` +
-            `Fields injected:\n${fieldSummary}\n\n` +
-            `Generated block:\n${"─".repeat(40)}\n${modelBlock}\n${"─".repeat(40)}` +
-            warningsText +
-            prismaWarning
-        );
+            const warningsText = warnings.length ? `\n${warnings.join("\n")}` : "";
+
+            report.humanMessage =
+                `[SUCCESS] Model "${modelName}" successfully appended to:\n` +
+                `   ${resolvedPath}\n\n` +
+                `Fields injected:\n${fieldSummary}\n\n` +
+                `Generated block:\n${"─".repeat(40)}\n${modelBlock}\n${"─".repeat(40)}` +
+                warningsText +
+                prismaWarning;
+        });
     },
 };

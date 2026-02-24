@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectEnvSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -76,24 +77,24 @@ export const injectEnvValidation: Tool<FastMCPSessionAuth, InjectEnvParams> = {
 
     execute: async (args) => {
         const { targetSrcDirectory, dryRun } = args;
-        const configDir = path.resolve(targetSrcDirectory, "config");
-        const filePath = path.join(configDir, "env.ts");
-
-        // The project root is typically one level up from src
         const projectRoot = path.resolve(targetSrcDirectory, "..");
-        const envFilePath = path.join(projectRoot, ".env");
 
-        if (!fs.existsSync(configDir)) {
-            fs.mkdirSync(configDir, { recursive: true });
-        }
+        return withMutationReport("inject_env_validation", dryRun ? null : projectRoot, async (report) => {
+            const configDir = path.resolve(targetSrcDirectory, "config");
+            const filePath = path.join(configDir, "env.ts");
+            const envFilePath = path.join(projectRoot, ".env");
 
-        if (fs.existsSync(filePath)) {
-            return "[ERROR] Guard: env.ts already exists.";
-        }
+            if (!fs.existsSync(configDir)) {
+                fs.mkdirSync(configDir, { recursive: true });
+            }
 
-        const code = buildEnvConfig();
+            if (fs.existsSync(filePath)) {
+                throw new Error("Guard: env.ts already exists.");
+            }
 
-        const dummyEnvContent = `PORT=3000
+            const code = buildEnvConfig();
+
+            const dummyEnvContent = `PORT=3000
 NODE_ENV=development
 DATABASE_URL=postgresql://user:password@localhost:5432/social_saas?schema=public
 JWT_SECRET=super_secret_jwt_key_that_is_at_least_32_chars_long
@@ -110,14 +111,20 @@ RAZORPAY_WEBHOOK_SECRET=whsec_dummy
 CORS_ORIGIN=*
 `;
 
-        if (dryRun) return code;
+            if (dryRun) {
+                report.humanMessage = code;
+                return;
+            }
 
-        fs.writeFileSync(filePath, code, "utf-8");
+            fs.writeFileSync(filePath, code, "utf-8");
+            report.mutatedFiles.push(filePath);
 
-        if (!fs.existsSync(envFilePath)) {
-            fs.writeFileSync(envFilePath, dummyEnvContent, "utf-8");
-        }
+            if (!fs.existsSync(envFilePath)) {
+                fs.writeFileSync(envFilePath, dummyEnvContent, "utf-8");
+                report.mutatedFiles.push(envFilePath);
+            }
 
-        return "[SUCCESS] Environment validation injected to src/config/env.ts and .env generated. \\n\\n[INFO] Install dependency: npm install dotenv zod";
+            report.humanMessage = "[SUCCESS] Environment validation injected to src/config/env.ts and .env generated. \\n\\n[INFO] Install dependency: npm install dotenv zod";
+        });
     },
 };

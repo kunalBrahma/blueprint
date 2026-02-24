@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectSeedSchema = z.object({
   prismaDirectory: z.string().describe("Absolute path to the prisma folder (where schema.prisma lives)"),
@@ -24,7 +26,6 @@ const prisma = new PrismaClient();
 async function main() {
   console.log("Seeding database...");
 
-  // Seed Admin User
   const adminEmail = "admin@example.com";
   let admin = await prisma.user.findUnique({ where: { email: adminEmail } });
   
@@ -43,7 +44,6 @@ async function main() {
     console.log("[INFO] Admin user already exists");
   }
 
-  // Seed Dummy Products
   const products = [
     { name: "Premium Widget", description: "A high-quality widget", price: 99.99, stock: 50 },
     { name: "Basic Gadget", description: "An essential gadget for everyday use", price: 29.99, stock: 200 },
@@ -84,50 +84,54 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
   execute: async (args) => {
     const { prismaDirectory, dryRun } = args;
     const resolvedPath = path.resolve(prismaDirectory);
+    const projectRoot = path.resolve(resolvedPath, "..");
 
-    if (!fs.existsSync(resolvedPath)) {
-      return `[ERROR] Error: Prisma directory not found: "${resolvedPath}"`;
-    }
-
-    const seedPath = path.join(resolvedPath, "seed.ts");
-    const packageJsonPath = path.join(resolvedPath, "../package.json");
-
-    if (fs.existsSync(seedPath)) {
-      return `[ERROR] Guard: File already exists: "${seedPath}"`;
-    }
-
-    const seedCode = buildSeedCode();
-
-    if (dryRun) {
-      return `[INFO] DRY RUN\n\n--- seed.ts ---\n${seedCode}`;
-    }
-
-    let packageWarnings = "\\n\\n[INFO] Packages to manually install:\\n  npm install ts-node -D";
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(resolvedPath, "..");
-      if (fs.existsSync(packageJsonPath)) {
-        console.log("\\n[INFO] Auto-installing dependencies for seed script...");
-        execSync("npm install bcrypt --no-save --save-exact", { cwd, stdio: "inherit" });
-        execSync("npm install -D ts-node @types/bcrypt @types/node --no-save --save-exact", { cwd, stdio: "inherit" });
-        packageWarnings = "\\n\\n[SUCCESS] Packages automatically installed:\\n  bcrypt, ts-node, @types/bcrypt";
+    return withMutationReport("inject_prisma_seed", dryRun ? null : projectRoot, async (report) => {
+      if (!fs.existsSync(resolvedPath)) {
+        throw new Error(`Prisma directory not found: "${resolvedPath}"`);
       }
-    } catch (err: unknown) {
-      packageWarnings = "\\n\\n[WARNING] Failed to auto-install packages. Please manually run:\\n  npm install bcrypt\\n  npm install -D ts-node @types/bcrypt";
-    }
 
-    fs.writeFileSync(seedPath, seedCode, "utf-8");
+      const seedPath = path.join(resolvedPath, "seed.ts");
+      const packageJsonPath = path.join(resolvedPath, "../package.json");
 
-    // Attempt to update package.json with prisma seed command
-    if (fs.existsSync(packageJsonPath)) {
+      if (fs.existsSync(seedPath)) {
+        throw new Error(`Guard: File already exists: "${seedPath}"`);
+      }
+
+      const seedCode = buildSeedCode();
+
+      if (dryRun) {
+        report.humanMessage = `[INFO] DRY RUN\n\n--- seed.ts ---\n${seedCode}`;
+        return;
+      }
+
+      let packageWarnings = "\n\n[INFO] Packages to manually install:\n  npm install ts-node -D";
       try {
-        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
-        if (!pkg.prisma) pkg.prisma = {};
-        pkg.prisma.seed = "ts-node prisma/seed.ts";
-        fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2), "utf-8");
-      } catch (e) { }
-    }
+        const cwd = projectRoot;
+        if (fs.existsSync(packageJsonPath)) {
+          execSync("npm install bcrypt --no-save --save-exact", { cwd, stdio: "inherit" });
+          execSync("npm install -D ts-node @types/bcrypt @types/node --no-save --save-exact", { cwd, stdio: "inherit" });
+          packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n  bcrypt, ts-node, @types/bcrypt";
+        }
+      } catch (err: unknown) {
+        packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install bcrypt\n  npm install -D ts-node @types/bcrypt";
+        report.status = "PARTIAL_FAILURE";
+      }
 
-    return `[SUCCESS] Prisma seed.ts generated successfully!\n\nTo run it: npx prisma db seed${packageWarnings}`;
+      fs.writeFileSync(seedPath, seedCode, "utf-8");
+      report.mutatedFiles.push(seedPath);
+
+      if (fs.existsSync(packageJsonPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+          if (!pkg.prisma) pkg.prisma = {};
+          pkg.prisma.seed = "ts-node prisma/seed.ts";
+          fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2), "utf-8");
+          report.mutatedFiles.push(packageJsonPath);
+        } catch (e) { }
+      }
+
+      report.humanMessage = `[SUCCESS] Prisma seed.ts generated successfully!\n\nTo run it: npx prisma db seed${packageWarnings}`;
+    });
   },
 };

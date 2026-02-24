@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectMailSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -31,7 +33,7 @@ export const mailService = {
   async sendEmail({ to, subject, html }: SendEmailParams): Promise<void> {
     try {
       const { data, error } = await resend.emails.send({
-        from: "Acme <onboarding@resend.dev>", // Replace with your verified sender IDEally
+        from: "Acme <onboarding@resend.dev>",
         to: [to],
         subject,
         html,
@@ -54,7 +56,7 @@ export const mailService = {
     return sourceFile.getFullText();
 }
 
-function updateAuthController(targetSrcDirectory: string) {
+function updateAuthController(targetSrcDirectory: string, report: { mutatedFiles: string[] }): string {
     const authControllerPath = path.resolve(targetSrcDirectory, "controllers/auth.controller.ts");
     if (!fs.existsSync(authControllerPath)) return "[WARNING] auth.controller.ts not found, skipping AST injection.";
 
@@ -72,7 +74,6 @@ function updateAuthController(targetSrcDirectory: string) {
         });
     }
 
-    // Replace console.log placeholder
     for (const stmt of forgotPasswordFn.getStatements()) {
         if (Node.isExpressionStatement(stmt)) {
             const expr = stmt.getExpression();
@@ -95,6 +96,7 @@ function updateAuthController(targetSrcDirectory: string) {
     sourceFile.fixUnusedIdentifiers();
     sourceFile.organizeImports();
     fs.writeFileSync(authControllerPath, sourceFile.getFullText(), "utf-8");
+    report.mutatedFiles.push(authControllerPath);
     return "[SUCCESS] AST Integration: Replaced console placeholder with actual mailService.sendEmail() in auth.controller.ts.";
 }
 
@@ -105,43 +107,43 @@ export const injectMailProvider: Tool<FastMCPSessionAuth, InjectMailParams> = {
 
     execute: async (args) => {
         const { targetSrcDirectory, dryRun } = args;
+        const projectRoot = path.resolve(targetSrcDirectory, "..");
 
-        const servicesDir = path.resolve(targetSrcDirectory, "services");
-        if (!fs.existsSync(servicesDir)) {
-            fs.mkdirSync(servicesDir, { recursive: true });
-        }
-
-        const filePath = path.join(servicesDir, "mail.service.ts");
-        if (fs.existsSync(filePath)) {
-            return `[ERROR] Error: File already exists: "\${filePath}".`;
-        }
-
-        const content = buildMailService();
-
-        if (dryRun) {
-            return `[INFO] DRY RUN\\n\\n\${content}`;
-        }
-
-        try {
-            fs.writeFileSync(filePath, content, "utf-8");
-        } catch (err: unknown) {
-            return `[ERROR] Error writing file: \${err}`;
-        }
-
-        const astResult = updateAuthController(targetSrcDirectory);
-
-        let packageWarnings = "\\n\\n[SUCCESS] Packages automatically installed:\\n  resend";
-        try {
-            const execSync = require("node:child_process").execSync;
-            const cwd = path.resolve(targetSrcDirectory, "..");
-            if (fs.existsSync(path.join(cwd, "package.json"))) {
-                console.log("\\n[INFO] Auto-installing dependencies for mail service...");
-                execSync("npm install resend --no-save --save-exact", { cwd, stdio: "inherit" });
+        return withMutationReport("inject_mail_provider", dryRun ? null : projectRoot, async (report) => {
+            const servicesDir = path.resolve(targetSrcDirectory, "services");
+            if (!fs.existsSync(servicesDir)) {
+                fs.mkdirSync(servicesDir, { recursive: true });
             }
-        } catch (err: unknown) {
-            packageWarnings = "\\n\\n[WARNING] Failed to auto-install packages. Please manually run:\\n  npm install resend";
-        }
 
-        return `[SUCCESS] Mail Provider injected successfully!\\nFile: \${filePath}\\n\${astResult}\${packageWarnings}`;
+            const filePath = path.join(servicesDir, "mail.service.ts");
+            if (fs.existsSync(filePath)) {
+                throw new Error(`File already exists: "${filePath}".`);
+            }
+
+            const content = buildMailService();
+
+            if (dryRun) {
+                report.humanMessage = `[INFO] DRY RUN\n\n${content}`;
+                return;
+            }
+
+            fs.writeFileSync(filePath, content, "utf-8");
+            report.mutatedFiles.push(filePath);
+
+            const astResult = updateAuthController(targetSrcDirectory, report);
+
+            let packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n  resend";
+            try {
+                const cwd = projectRoot;
+                if (fs.existsSync(path.join(cwd, "package.json"))) {
+                    execSync("npm install resend --no-save --save-exact", { cwd, stdio: "inherit" });
+                }
+            } catch (err: unknown) {
+                packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install resend";
+                report.status = "PARTIAL_FAILURE";
+            }
+
+            report.humanMessage = `[SUCCESS] Mail Provider injected successfully!\nFile: ${filePath}\n${astResult}${packageWarnings}`;
+        });
     },
 };

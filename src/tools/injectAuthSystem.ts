@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -14,7 +16,6 @@ const injectAuthSchema = z.object({
     .enum(["email", "google"])
     .array()
     .describe("Array of authentication providers to implement (e.g., ['email', 'google'])"),
-
   dryRun: z
     .boolean()
     .default(false)
@@ -88,7 +89,6 @@ function buildAuthController(authProviders: string[], targetDir: string): string
   const project = new Project({ useInMemoryFileSystem: true });
   const sourceFile = project.createSourceFile("auth.controller.ts", "", { overwrite: true });
 
-  // Imports
   sourceFile.addImportDeclaration({
     namedImports: ["Request", "Response"],
     moduleSpecifier: "express",
@@ -107,7 +107,7 @@ function buildAuthController(authProviders: string[], targetDir: string): string
   });
   sourceFile.addImportDeclaration({
     defaultImport: "prisma",
-    moduleSpecifier: "../config/prisma", // standard boilerplate path
+    moduleSpecifier: "../config/prisma",
   });
   sourceFile.addImportDeclaration({
     namedImports: ["generateAccessToken", "generateRefreshToken", "verifyToken", "TokenPayload"],
@@ -125,7 +125,6 @@ function buildAuthController(authProviders: string[], targetDir: string): string
     });
   }
 
-  // Add Zod Schemas
   sourceFile.addStatements(`
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 export interface RequestWithUser extends Request {
@@ -173,7 +172,6 @@ const tokenSchema = z.object({
     });
   };
 
-  // Always add Email/Password logic if email is selected (or just default)
   addFn("signUp", `
   try {
     const { email, password, name } = signUpSchema.parse(req.body);
@@ -274,7 +272,6 @@ const tokenSchema = z.object({
   try {
     const { refreshToken } = tokenSchema.parse(req.body);
 
-    // Verify token structure
     let decoded: TokenPayload;
     try {
       decoded = verifyToken(refreshToken, env.JWT_SECRET) as TokenPayload;
@@ -283,14 +280,12 @@ const tokenSchema = z.object({
       return;
     }
 
-    // Check if it exists in DB (to detect reuse / handle revocation)
     const existingToken = await prisma.refreshToken.findUnique({ where: { token: refreshToken } });
     if (!existingToken) {
       res.status(401).json({ success: false, message: "Invalid or revoked refresh token" });
       return;
     }
 
-    // Rotation: Delete old token, issue new pair
     await prisma.refreshToken.delete({ where: { id: existingToken.id } });
 
     const newAccessToken = generateAccessToken({ id: decoded.id }, env.JWT_SECRET);
@@ -324,9 +319,8 @@ const tokenSchema = z.object({
       return;
     }
 
-    // Generate token and save to DB
     const resetToken = Math.random().toString(36).substring(2, 15);
-    const expiresAt = new Date(Date.now() + 3600000); // 1 hour
+    const expiresAt = new Date(Date.now() + 3600000);
 
     await prisma.passwordResetToken.create({
       data: {
@@ -336,7 +330,6 @@ const tokenSchema = z.object({
       }
     });
 
-    // TODO: Actually send the email here using an email service
     console.log(\`Sending password reset email to \${email} with token: \${resetToken}\`);
 
     res.status(200).json({ success: true, message: "Password reset instructions sent" });
@@ -366,7 +359,6 @@ const tokenSchema = z.object({
       data: { password: hashedPassword }
     });
 
-    // Clean up used token
     await prisma.passwordResetToken.delete({ where: { token } });
 
     res.status(200).json({ success: true, message: "Password updated successfully" });
@@ -384,7 +376,6 @@ const tokenSchema = z.object({
     addFn("googleLogin", `
   try {
     const authReq = req as RequestWithUser;
-    // This expects passport middleware to have populated req.user
     if (!authReq.user) {
       res.status(401).json({ success: false, message: "Authentication failed" });
       return;
@@ -399,7 +390,6 @@ const tokenSchema = z.object({
       data: { token: refreshToken, userId: user.id }
     });
 
-    // Redirect to frontend or send JSON depending on architecture
     res.status(200).json({
       success: true,
       accessToken,
@@ -430,103 +420,96 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
 
   execute: async (args) => {
     const { targetDirectory, authProviders, dryRun } = args;
-
     const controllersDir = path.resolve(targetDirectory);
-    const utilsDir = path.resolve(controllersDir, "../utils");
+    const projectRoot = path.resolve(controllersDir, "../..");
 
-    if (!fs.existsSync(controllersDir)) {
-      return `[ERROR] Error: Controllers directory not found: "${controllersDir}"`;
-    }
+    return withMutationReport("inject_auth_system", dryRun ? null : projectRoot, async (report) => {
+      const utilsDir = path.resolve(controllersDir, "../utils");
 
-    const controllerPath = path.join(controllersDir, "auth.controller.ts");
-    const utilsPath = path.join(utilsDir, "auth.ts");
+      if (!fs.existsSync(controllersDir)) {
+        throw new Error(`Controllers directory not found: "${controllersDir}"`);
+      }
 
-    // Guard: refuse to overwrite
-    if (fs.existsSync(controllerPath)) {
-      return `[ERROR] Error: File already exists: "${controllerPath}". Refusing to overwrite.`;
-    }
-    if (fs.existsSync(utilsPath)) {
-      return `[ERROR] Error: File already exists: "${utilsPath}". Refusing to overwrite.`;
-    }
+      const controllerPath = path.join(controllersDir, "auth.controller.ts");
+      const utilsPath = path.join(utilsDir, "auth.ts");
 
-    const authUtilsCode = buildAuthUtils();
-    const authControllerCode = buildAuthController(authProviders, controllersDir);
+      if (fs.existsSync(controllerPath)) {
+        throw new Error(`File already exists: "${controllerPath}". Refusing to overwrite.`);
+      }
+      if (fs.existsSync(utilsPath)) {
+        throw new Error(`File already exists: "${utilsPath}". Refusing to overwrite.`);
+      }
 
-    if (dryRun) {
-      const sep = "─".repeat(60);
-      return (
-        `[INFO] DRY RUN — No file was written.\n\n` +
-        `${sep}\nPROPOSED FILE: src/utils/auth.ts\n${sep}\n` +
-        authUtilsCode +
-        `\n${sep}\nPROPOSED FILE: controllers/auth.controller.ts\n${sep}\n` +
-        authControllerCode +
-        `\n${sep}`
-      );
-    }
+      const authUtilsCode = buildAuthUtils();
+      const authControllerCode = buildAuthController(authProviders, controllersDir);
 
-    try {
-      // Ensure utils directory exists
+      if (dryRun) {
+        const sep = "─".repeat(60);
+        report.humanMessage =
+          `[INFO] DRY RUN — No file was written.\n\n` +
+          `${sep}\nPROPOSED FILE: src/utils/auth.ts\n${sep}\n` +
+          authUtilsCode +
+          `\n${sep}\nPROPOSED FILE: controllers/auth.controller.ts\n${sep}\n` +
+          authControllerCode +
+          `\n${sep}`;
+        return;
+      }
+
       if (!fs.existsSync(utilsDir)) {
         fs.mkdirSync(utilsDir, { recursive: true });
       }
 
       fs.writeFileSync(utilsPath, authUtilsCode, "utf-8");
+      report.mutatedFiles.push(utilsPath);
       fs.writeFileSync(controllerPath, authControllerCode, "utf-8");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return `[ERROR] Error writing files: ${msg}`;
-    }
+      report.mutatedFiles.push(controllerPath);
 
-    let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  bcrypt jsonwebtoken zod`;
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(controllersDir, "../..");
-      if (fs.existsSync(path.join(cwd, "package.json"))) {
-        const pkgs = ["bcrypt", "jsonwebtoken", "zod"];
-        const devPkgs = ["@types/bcrypt", "@types/jsonwebtoken"];
-        const pkgJsonPath = path.join(cwd, "package.json");
-        const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-        const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
-        const need = pkgs.filter(p => !allDeps[p]);
-        const needDev = devPkgs.filter(p => !allDeps[p]);
-        if (need.length > 0) {
-          const installCmd = `npm install ${need.join(" ")} --no-save --save-exact`;
-          execSync(installCmd, { cwd, stdio: "inherit" });
-        }
-        if (needDev.length > 0) {
-          const installCmd = `npm install -D ${needDev.join(" ")} --no-save --save-exact`;
-          execSync(installCmd, { cwd, stdio: "inherit" });
-        }
-        if (authProviders.includes("google")) {
-          const authPkgs = ["passport", "passport-google-oauth20"];
-          const authDev = ["@types/passport", "@types/passport-google-oauth20"];
-          const allDeps2 = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
-          const needAuth = authPkgs.filter(p => !allDeps2[p]);
-          const needAuthDev = authDev.filter(p => !allDeps2[p]);
-          if (needAuth.length > 0) {
-            const installCmd = `npm install ${needAuth.join(" ")} --no-save --save-exact`;
-            execSync(installCmd, { cwd, stdio: "inherit" });
+      let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  bcrypt jsonwebtoken zod`;
+      try {
+        const cwd = projectRoot;
+        if (fs.existsSync(path.join(cwd, "package.json"))) {
+          const pkgs = ["bcrypt", "jsonwebtoken", "zod"];
+          const devPkgs = ["@types/bcrypt", "@types/jsonwebtoken"];
+          const pkgJsonPath = path.join(cwd, "package.json");
+          const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+          const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
+          const need = pkgs.filter(p => !allDeps[p]);
+          const needDev = devPkgs.filter(p => !allDeps[p]);
+          if (need.length > 0) {
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
           }
-          if (needAuthDev.length > 0) {
-            const installCmd = `npm install -D ${needAuthDev.join(" ")} --no-save --save-exact`;
-            execSync(installCmd, { cwd, stdio: "inherit" });
+          if (needDev.length > 0) {
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
           }
-          packageWarnings += `\n  passport passport-google-oauth20`;
+          if (authProviders.includes("google")) {
+            const authPkgs = ["passport", "passport-google-oauth20"];
+            const authDev = ["@types/passport", "@types/passport-google-oauth20"];
+            const allDeps2 = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
+            const needAuth = authPkgs.filter(p => !allDeps2[p]);
+            const needAuthDev = authDev.filter(p => !allDeps2[p]);
+            if (needAuth.length > 0) {
+              execSync(`npm install ${needAuth.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            }
+            if (needAuthDev.length > 0) {
+              execSync(`npm install -D ${needAuthDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            }
+            packageWarnings += `\n  passport passport-google-oauth20`;
+          }
         }
+      } catch (err: unknown) {
+        packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install bcrypt jsonwebtoken zod\n  npm install -D @types/bcrypt @types/jsonwebtoken`;
+        report.status = "PARTIAL_FAILURE";
       }
-    } catch (err: unknown) {
-      packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install bcrypt jsonwebtoken zod\n  npm install -D @types/bcrypt @types/jsonwebtoken`;
-    }
 
-    let prismaWarnings = `\n\n[WARNING] Prisma Schema Requirements:\n  Please ensure your schema.prisma contains at minimum:\n  - User model (id, email, password, name)\n  - PasswordResetToken model (id, token, userId, expiresAt)\n  - RefreshToken model (id, token (unique), userId)\n  - Account model (if using Google OAuth)`;
+      const prismaWarnings = `\n\n[WARNING] Prisma Schema Requirements:\n  Please ensure your schema.prisma contains at minimum:\n  - User model (id, email, password, name)\n  - PasswordResetToken model (id, token, userId, expiresAt)\n  - RefreshToken model (id, token (unique), userId)\n  - Account model (if using Google OAuth)`;
 
-    return (
-      `[SUCCESS] Auth System injected successfully!\n\n` +
-      `Generated Files:\n` +
-      `  • ${utilsPath}\n` +
-      `  • ${controllerPath}` +
-      packageWarnings +
-      prismaWarnings
-    );
+      report.humanMessage =
+        `[SUCCESS] Auth System injected successfully!\n\n` +
+        `Generated Files:\n` +
+        `  - ${utilsPath}\n` +
+        `  - ${controllerPath}` +
+        packageWarnings +
+        prismaWarnings;
+    });
   },
 };

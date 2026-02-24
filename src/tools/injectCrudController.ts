@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectCrudSchema = z.object({
   modelName: z.string().regex(/^[A-Z][a-zA-Z0-9]*$/, "modelName must be PascalCase"),
@@ -101,7 +102,6 @@ function buildCrudController(modelName: string, hasStorage: boolean, targetDir: 
     const data: any = { ...req.body };
 `;
   fields.forEach(f => {
-    // strict Zod/Prisma parity: Provide a default fallback in create logic for required string fields
     if (!f.isOptional && f.name !== "id" && f.name !== "createdAt" && f.name !== "updatedAt" && f.type === "String") {
       if (f.name !== "imageUrl" && f.name !== "thumbnailPath" && !f.name.endsWith("Id")) {
         createBody += `    data.${f.name} = data.${f.name} || "Default";\n`;
@@ -142,7 +142,6 @@ ${createBody}
 
     const where: any = { ...filters };
     if (search) {
-      // Basic search logic (requires name/title field or adjust as needed)
       where.OR = [
         { name: { contains: search as string, mode: "insensitive" } },
         { description: { contains: search as string, mode: "insensitive" } }
@@ -251,40 +250,34 @@ export const injectCrudController: Tool<FastMCPSessionAuth, InjectCrudParams> = 
 
   execute: async (args) => {
     const { modelName, targetDirectory, dryRun } = args;
-
     const resolvedDir = path.resolve(targetDirectory);
-    if (!fs.existsSync(resolvedDir)) return `[ERROR] Error: Directory not found: "${resolvedDir}"`;
+    const projectRoot = path.resolve(resolvedDir, "../..");
 
-    const fileName = `${toCamel(modelName)}.controller.ts`;
-    const outputPath = path.join(resolvedDir, fileName);
+    return withMutationReport("inject_crud_controller", dryRun ? null : projectRoot, async (report) => {
+      if (!fs.existsSync(resolvedDir)) throw new Error(`Directory not found: "${resolvedDir}"`);
 
-    if (fs.existsSync(outputPath)) {
-      return `[ERROR] Error: File already exists: "${outputPath}".`;
-    }
+      const fileName = `${toCamel(modelName)}.controller.ts`;
+      const outputPath = path.join(resolvedDir, fileName);
 
-    const hasStorage = fs.existsSync(path.join(resolvedDir, "../middleware/upload.ts"));
+      if (fs.existsSync(outputPath)) {
+        throw new Error(`File already exists: "${outputPath}".`);
+      }
 
-    let content: string;
-    try {
-      content = buildCrudController(modelName, hasStorage, resolvedDir);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return `[ERROR] Code Generation Error: ${msg}`;
-    }
+      const hasStorage = fs.existsSync(path.join(resolvedDir, "../middleware/upload.ts"));
 
-    if (dryRun) {
-      const sep = "─".repeat(60);
-      return `[INFO] DRY RUN\n${sep}\n${content}\n${sep}`;
-    }
+      const content = buildCrudController(modelName, hasStorage, resolvedDir);
 
-    try {
+      if (dryRun) {
+        const sep = "─".repeat(60);
+        report.humanMessage = `[INFO] DRY RUN\n${sep}\n${content}\n${sep}`;
+        return;
+      }
+
       fs.writeFileSync(outputPath, content, "utf-8");
-    } catch (err: unknown) {
-      return `[ERROR] Error writing file: ${err}`;
-    }
+      report.mutatedFiles.push(outputPath);
 
-    const msg = hasStorage ? "\\n[INFO] Storage middleware detected! Added req.file logic." : "";
-
-    return `[SUCCESS] CRUD controller generated successfully!\nFile: ${outputPath}${msg}`;
+      const msg = hasStorage ? "\\n[INFO] Storage middleware detected! Added req.file logic." : "";
+      report.humanMessage = `[SUCCESS] CRUD controller generated successfully!\nFile: ${outputPath}${msg}`;
+    });
   },
 };

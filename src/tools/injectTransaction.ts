@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -31,20 +32,19 @@ type InjectTransactionParams = typeof injectTransactionSchema;
 // ─── 2. Transaction Shell Template ───────────────────────────────────────────
 
 function buildTransactionFunction(functionName: string, transactionLogic: string, callbackAction?: string): string {
-        // Indent the user's logic correctly to match the nested block of prisma.$transaction
-        const indentedLogic = transactionLogic
-                .split("\n")
-                .map((line) => (line.trim() === "" ? "" : `      ${line}`))
-                .join("\n");
+    const indentedLogic = transactionLogic
+        .split("\n")
+        .map((line) => (line.trim() === "" ? "" : `      ${line}`))
+        .join("\n");
 
-        const indentedCallback = callbackAction
-                ? callbackAction
-                            .split("\n")
-                            .map((line) => (line.trim() === "" ? "" : `    ${line}`))
-                            .join("\n")
-                : "";
+    const indentedCallback = callbackAction
+        ? callbackAction
+            .split("\n")
+            .map((line) => (line.trim() === "" ? "" : `    ${line}`))
+            .join("\n")
+        : "";
 
-        return `
+    return `
 export async function ${functionName}(req: Request, res: Response): Promise<void> {
     try {
         const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
@@ -72,7 +72,6 @@ function ensureDynamicImports(
     warnings: string[]
 ) {
     if (transactionLogic.includes("Stripe") || transactionLogic.includes("stripe")) {
-        // Avoid adding import if symbol already exists from another module
         const existing = sourceFile.getImportDeclarations().find(imp => {
             const def = imp.getDefaultImport();
             const named = imp.getNamedImports().some(n => n.getName() === "Stripe");
@@ -88,13 +87,11 @@ function ensureDynamicImports(
     }
 
     if (transactionLogic.includes("paymentService")) {
-        // Ensure named import 'paymentService' exists, avoid conflicts
         const paymentImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../services/payment.service");
         if (paymentImport) {
             const hasNamed = paymentImport.getNamedImports().some((n) => n.getName() === "paymentService");
             if (!hasNamed) paymentImport.addNamedImport("paymentService");
         } else {
-            // If paymentService symbol exists from other module, warn and skip
             const existing = sourceFile.getImportDeclarations().find(imp => imp.getNamedImports().some(n => n.getName() === "paymentService") || (imp.getDefaultImport()?.getText() === "paymentService"));
             if (existing) {
                 warnings.push(`[WARNING] Symbol 'paymentService' already imported from '${existing.getModuleSpecifierValue()}'. Skipping import from '../services/payment.service'.`);
@@ -154,7 +151,6 @@ function ensureExpressAndPrismaImports(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>,
     warnings: string[]
 ) {
-    // Ensure Express
     const expressImport = sourceFile.getImportDeclaration(
         (imp) => imp.getModuleSpecifierValue() === "express"
     );
@@ -173,13 +169,11 @@ function ensureExpressAndPrismaImports(
         }
     }
 
-    // Ensure Prisma default import (prisma client instance)
     const hasPrismaInstance = sourceFile.getImportDeclarations().some(
         (imp) => imp.getDefaultImport()?.getText() === "prisma" || imp.getModuleSpecifierValue().includes("../config/prisma")
     );
 
     if (!hasPrismaInstance) {
-        // If a symbol named 'prisma' is already imported from elsewhere, warn and skip
         const existing = sourceFile.getImportDeclarations().find(imp => imp.getDefaultImport()?.getText() === "prisma" || imp.getNamedImports().some(n => n.getName() === "prisma"));
         if (existing && !existing.getModuleSpecifierValue().includes("../config/prisma")) {
             warnings.push(`[WARNING] Symbol 'prisma' already imported from '${existing.getModuleSpecifierValue()}'. Skipping automatic import from '../config/prisma'.`);
@@ -188,7 +182,6 @@ function ensureExpressAndPrismaImports(
         }
     }
 
-    // Explicitly ensure 'Prisma' type is imported for Prisma.TransactionClient
     const prismaClientImport = sourceFile.getImportDeclaration(
         (imp) => imp.getModuleSpecifierValue() === "@prisma/client"
     );
@@ -235,71 +228,71 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
 
     execute: async (args) => {
         const { targetFile, functionName, transactionLogic, callbackAction, dryRun } = args;
-
         const resolvedPath = path.resolve(targetFile);
+        const projectRoot = path.resolve(resolvedPath, "../../..");
 
-        // ── 1. Read or Create File ──────────────────────────────────────────────
-        let fileContent = "";
-        let isNewFile = false;
+        return withMutationReport("inject_transaction", dryRun ? null : projectRoot, async (report) => {
+            // ── 1. Read or Create File ──────────────────────────────────────────────
+            let fileContent = "";
+            let isNewFile = false;
 
-        if (fs.existsSync(resolvedPath)) {
-            try {
-                fileContent = fs.readFileSync(resolvedPath, "utf-8");
-            } catch (err: unknown) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return `[ERROR] Error reading file: ${msg}`;
+            if (fs.existsSync(resolvedPath)) {
+                try {
+                    fileContent = fs.readFileSync(resolvedPath, "utf-8");
+                } catch (err: unknown) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    throw new Error(`Error reading file: ${msg}`);
+                }
+            } else {
+                isNewFile = true;
             }
-        } else {
-            isNewFile = true;
-        }
 
-        // ── 2. Create AST ──────────────────────────────────────────────────────
-        const project = new Project({
-            useInMemoryFileSystem: true,
-            compilerOptions: { allowJs: true },
-        });
+            // ── 2. Create AST ──────────────────────────────────────────────────────
+            const project = new Project({
+                useInMemoryFileSystem: true,
+                compilerOptions: { allowJs: true },
+            });
 
-        const sourceFile = project.createSourceFile(resolvedPath, fileContent, {
-            overwrite: true,
-        });
+            const sourceFile = project.createSourceFile(resolvedPath, fileContent, {
+                overwrite: true,
+            });
 
-        // ── 3. Guard against overwriting ───────────────────────────────────────
-        if (!isNewFile && hasFunction(sourceFile, functionName)) {
-            return (
-                `[ERROR] Guard Triggered: Function "${functionName}" already exists in ${resolvedPath}.\n` +
-                `Refusing to overwrite. Please delete it manually or choose a different functionName.`
-            );
-        }
+            // ── 3. Guard against overwriting ───────────────────────────────────────
+            if (!isNewFile && hasFunction(sourceFile, functionName)) {
+                throw new Error(
+                    `Guard Triggered: Function "${functionName}" already exists in ${resolvedPath}.\n` +
+                    `Refusing to overwrite. Please delete it manually or choose a different functionName.`
+                );
+            }
 
-        // ── 4. Ensure Imports ──────────────────────────────────────────────────
-        const warnings: string[] = [];
-        ensureExpressAndPrismaImports(sourceFile, warnings);
-        ensureDynamicImports(sourceFile, transactionLogic + (callbackAction ? `\n${callbackAction}` : ""), warnings);
+            // ── 4. Ensure Imports ──────────────────────────────────────────────────
+            const warnings: string[] = [];
+            ensureExpressAndPrismaImports(sourceFile, warnings);
+            ensureDynamicImports(sourceFile, transactionLogic + (callbackAction ? `\n${callbackAction}` : ""), warnings);
 
-        // ── 5. Inject the Transaction Function ─────────────────────────────────
-        const functionString = buildTransactionFunction(functionName, transactionLogic, callbackAction);
-        sourceFile.addStatements(`\n${functionString}`);
+            // ── 5. Inject the Transaction Function ─────────────────────────────────
+            const functionString = buildTransactionFunction(functionName, transactionLogic, callbackAction);
+            sourceFile.addStatements(`\n${functionString}`);
 
-        // ── 6. Dry Run ─────────────────────────────────────────────────────────
-        if (dryRun) {
-            const sep = "─".repeat(60);
-            return (
-                `[INFO] DRY RUN — No file was written.\n` +
-                `File:     ${resolvedPath} ${isNewFile ? "(NEW)" : "(EXISTING)"}\n` +
-                `Function: ${functionName}\n\n` +
-                `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
-                sourceFile.getFullText() +
-                `\n${sep}`
-            );
-        }
+            // ── 6. Dry Run ─────────────────────────────────────────────────────────
+            if (dryRun) {
+                const sep = "─".repeat(60);
+                report.humanMessage =
+                    `[INFO] DRY RUN — No file was written.\n` +
+                    `File:     ${resolvedPath} ${isNewFile ? "(NEW)" : "(EXISTING)"}\n` +
+                    `Function: ${functionName}\n\n` +
+                    `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
+                    sourceFile.getFullText() +
+                    `\n${sep}`;
+                return;
+            }
 
-        // ── 7. Write to Disk ───────────────────────────────────────────────────
-        try {
-            // Ensure directory exists if new file
+            // ── 7. Write to Disk ───────────────────────────────────────────────────
             if (isNewFile) {
                 fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
             }
             fs.writeFileSync(resolvedPath, sourceFile.getFullText(), "utf-8");
+            report.mutatedFiles.push(resolvedPath);
 
             // Build helper service if Razorpay is detected
             if (transactionLogic.includes("paymentService") || transactionLogic.includes("Razorpay") || transactionLogic.includes("razorpay")) {
@@ -327,24 +320,20 @@ export const paymentService = {
 };
 `.trimStart();
                     fs.writeFileSync(servicePath, serviceCode, "utf-8");
+                    report.mutatedFiles.push(servicePath);
                 }
             }
 
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error writing file: ${msg}`;
-        }
-
-        let resultMsg = (
-            `[SUCCESS] Transaction shell injected successfully!\n\n` +
-            `File:     ${resolvedPath}\n` +
-            `Function: ${functionName}\n\n` +
-            `The logic you provided has been cleanly wrapped inside a \`prisma.$transaction\` block ` +
-            `with Express req/res handling.`
-        );
-        if (warnings.length > 0) {
-            resultMsg += "\n\n" + warnings.map(w => w).join("\n");
-        }
-        return resultMsg;
+            let resultMsg =
+                `[SUCCESS] Transaction shell injected successfully!\n\n` +
+                `File:     ${resolvedPath}\n` +
+                `Function: ${functionName}\n\n` +
+                `The logic you provided has been cleanly wrapped inside a \`prisma.$transaction\` block ` +
+                `with Express req/res handling.`;
+            if (warnings.length > 0) {
+                resultMsg += "\n\n" + warnings.map(w => w).join("\n");
+            }
+            report.humanMessage = resultMsg;
+        });
     },
 };

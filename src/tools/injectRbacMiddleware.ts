@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Constants ──────────────────────────────────────────────────────────────
 
@@ -53,9 +54,6 @@ export function requireRoles(roles: string[]) {
 
 // ─── 4. AST Helpers ───────────────────────────────────────────────────────────
 
-/**
- * Ensure the Express type imports (Request, Response, NextFunction) are present.
- */
 function ensureExpressTypeImports(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>
 ): void {
@@ -66,7 +64,6 @@ function ensureExpressTypeImports(
     const needed = ["Request", "Response", "NextFunction"];
 
     if (!expressImport) {
-        // addImportDeclaration lets ts-morph handle placement — no manual index needed
         sourceFile.addImportDeclaration({
             namedImports: needed,
             moduleSpecifier: "express",
@@ -78,32 +75,22 @@ function ensureExpressTypeImports(
     const missingNames = needed.filter((n) => !existingNames.includes(n));
 
     if (missingNames.length > 0) {
-        // Batch add in one call — single AST mutation, safer than a per-name loop
         expressImport.addNamedImports(missingNames);
     }
 }
 
-/**
- * Check whether requireRoles is already defined or imported in the file.
- */
 function hasRequireRoles(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>
 ): boolean {
-    // 1. Named export / variable declaration
     for (const varDecl of sourceFile.getVariableDeclarations()) {
         if (varDecl.getName() === "requireRoles") return true;
     }
-    // 2. Named import from another file
     for (const imp of sourceFile.getImportDeclarations()) {
         if (imp.getNamedImports().some((n) => n.getName() === "requireRoles")) return true;
     }
     return false;
 }
 
-/**
- * Find the exact router.<method>("<routePath>", ...) call expression statement.
- * Returns the CallExpression node or undefined.
- */
 function findRouteCall(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>,
     method: string,
@@ -118,10 +105,8 @@ function findRouteCall(
         const callee = expr.getExpression();
         if (!Node.isPropertyAccessExpression(callee)) continue;
 
-        // method name must match
         if (callee.getName() !== method) continue;
 
-        // first argument must be the route path string literal
         const args = expr.getArguments();
         if (args.length === 0) continue;
 
@@ -134,10 +119,6 @@ function findRouteCall(
     return undefined;
 }
 
-/**
- * Core mutation: inject requireRoles([...roles]) as second argument of the
- * matched route call, shifting the existing handler(s) to the right.
- */
 function injectRbac(
     fileContent: string,
     filePath: string,
@@ -154,7 +135,6 @@ function injectRbac(
         overwrite: true,
     });
 
-    // ── A: Ensure requireRoles is available  ──────────────────────────────────
     let middlewareAction = "";
     if (!hasRequireRoles(sourceFile)) {
         ensureExpressTypeImports(sourceFile);
@@ -164,7 +144,6 @@ function injectRbac(
         middlewareAction = "requireRoles already present — skipped injection";
     }
 
-    // ── B: Find the target route call ─────────────────────────────────────────
     const routeCall = findRouteCall(sourceFile, method, routePath);
     if (!routeCall) {
         throw new Error(
@@ -173,7 +152,6 @@ function injectRbac(
         );
     }
 
-    // ── C: Guard against double-injection ─────────────────────────────────────
     const existingArgs = routeCall.getArguments();
     const alreadySecured = existingArgs.some((arg) => {
         const text = arg.getText().replace(/\s/g, "");
@@ -187,12 +165,9 @@ function injectRbac(
         );
     }
 
-    // ── D: Insert requireRoles as the second argument ─────────────────────────
-    // router.post("/", createBooking)  →  router.post("/", requireRoles([...]), createBooking)
     const rolesLiteral =
         `requireRoles([${allowedRoles.map((r) => `"${r}"`).join(", ")}])`;
 
-    // insertArguments inserts at a 0-based index
     routeCall.insertArgument(1, rolesLiteral);
 
     sourceFile.fixUnusedIdentifiers();
@@ -217,33 +192,30 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
 
     execute: async (args) => {
         const { targetFile, routePath, method, allowedRoles, dryRun } = args;
-
-        // ── Validate target file ───────────────────────────────────────────────
         const resolvedPath = path.resolve(targetFile);
+        const projectRoot = path.resolve(resolvedPath, "../../..");
 
-        if (!fs.existsSync(resolvedPath)) {
-            return `[ERROR] Error: File not found: "${resolvedPath}"`;
-        }
+        return withMutationReport("inject_rbac_middleware", dryRun ? null : projectRoot, async (report) => {
+            if (!fs.existsSync(resolvedPath)) {
+                throw new Error(`File not found: "${resolvedPath}"`);
+            }
 
-        const ext = path.extname(resolvedPath);
-        if (![".ts", ".js"].includes(ext)) {
-            return `[ERROR] Error: Target must be a .ts or .js file. Got: "${ext}"`;
-        }
+            const ext = path.extname(resolvedPath);
+            if (![".ts", ".js"].includes(ext)) {
+                throw new Error(`Target must be a .ts or .js file. Got: "${ext}"`);
+            }
 
-        // ── Read file ──────────────────────────────────────────────────────────
-        let originalContent: string;
-        try {
-            originalContent = fs.readFileSync(resolvedPath, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error reading file: ${msg}`;
-        }
+            let originalContent: string;
+            try {
+                originalContent = fs.readFileSync(resolvedPath, "utf-8");
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(`Error reading file: ${msg}`);
+            }
 
-        // ── Inject RBAC ────────────────────────────────────────────────────────
-        let modifiedContent: string;
-        let action: string;
+            let modifiedContent: string;
+            let action: string;
 
-        try {
             ({ result: modifiedContent, action } = injectRbac(
                 originalContent,
                 resolvedPath,
@@ -251,42 +223,32 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 routePath,
                 allowedRoles
             ));
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] RBAC Injection Error: ${msg}`;
-        }
 
-        // ── Dry run ────────────────────────────────────────────────────────────
-        if (dryRun) {
-            const sep = "─".repeat(60);
-            return (
-                `[INFO] DRY RUN — No file was written.\n` +
+            if (dryRun) {
+                const sep = "─".repeat(60);
+                report.humanMessage =
+                    `[INFO] DRY RUN — No file was written.\n` +
+                    `File:    ${resolvedPath}\n` +
+                    `Route:   ${method.toUpperCase()} ${routePath}\n` +
+                    `Roles:   [${allowedRoles.join(", ")} ]\n` +
+                    `Middleware: ${action}\n\n` +
+                    `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
+                    modifiedContent +
+                    `\n${sep}`;
+                return;
+            }
+
+            fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
+            report.mutatedFiles.push(resolvedPath);
+
+            report.humanMessage =
+                `[SUCCESS] RBAC secured successfully.\n\n` +
                 `File:    ${resolvedPath}\n` +
                 `Route:   ${method.toUpperCase()} ${routePath}\n` +
-                `Roles:   [${allowedRoles.join(", ")} ]\n` +
+                `Roles:   [${allowedRoles.join(", ")}]\n\n` +
                 `Middleware: ${action}\n\n` +
-                `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
-                modifiedContent +
-                `\n${sep}`
-            );
-        }
-
-        // ── Write to disk ──────────────────────────────────────────────────────
-        try {
-            fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `[ERROR] Error writing file: ${msg}`;
-        }
-
-        return (
-            `[SUCCESS] RBAC secured successfully.\n\n` +
-            `File:    ${resolvedPath}\n` +
-            `Route:   ${method.toUpperCase()} ${routePath}\n` +
-            `Roles:   [${allowedRoles.join(", ")}]\n\n` +
-            `Middleware: ${action}\n\n` +
-            `Result:\n` +
-            `  router.${method}("${routePath}", requireRoles([${allowedRoles.map((r) => `"${r}"`).join(", ")}]), <handler>)`
-        );
+                `Result:\n` +
+                `  router.${method}("${routePath}", requireRoles([${allowedRoles.map((r) => `"${r}"`).join(", ")}]), <handler>)`;
+        });
     },
 };

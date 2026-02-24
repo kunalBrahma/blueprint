@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectGlobalErrorSchema = z.object({
     serverFile: z.string().describe("Absolute path to the main application file (e.g. server.ts or app.ts)"),
@@ -25,8 +26,6 @@ export class AppError extends Error {
     super(message);
     this.statusCode = statusCode;
     this.isOperational = true;
-
-    // Capture stack trace, excluding the constructor call from it.
     Error.captureStackTrace(this, this.constructor);
   }
 }
@@ -61,7 +60,6 @@ export const globalErrorHandler = (
     message = err.message;
   }
 
-  // Log error in development or if it's an unhandled system error
     if (process.env.NODE_ENV === "development" || !(err instanceof AppError)) {
         console.error("[ERROR]:", err);
     }
@@ -82,7 +80,6 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     const project = new Project({ useInMemoryFileSystem: true });
     const sourceFile = project.createSourceFile(serverPath, serverContent, { overwrite: true });
 
-    // Ensure import
     const relImport = (() => {
         const rel = path.relative(path.dirname(serverPath), path.join(srcPath, "middleware/errorHandler"));
         const stripped = rel.replace(/\\/g, "/");
@@ -102,8 +99,7 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
         }
     }
 
-    // Identify Express App Variable
-    let appVarName = "app"; // standard fallback
+    let appVarName = "app";
     for (const varDecl of sourceFile.getVariableDeclarations()) {
         const init = varDecl.getInitializer();
         if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
@@ -112,7 +108,6 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
         }
     }
 
-    // Find all app.use / router mounts to insert AT THE VERY END
     const stmts = sourceFile.getStatements();
     let lastAppUseIndex = -1;
 
@@ -122,7 +117,7 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
         if (!Node.isCallExpression(expr)) return;
         const callee = expr.getExpression();
         if (Node.isPropertyAccessExpression(callee) && callee.getExpression().getText() === appVarName) {
-            lastAppUseIndex = i; // keep updating so we find the literal last one
+            lastAppUseIndex = i;
         }
     });
 
@@ -149,43 +144,47 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
 
     execute: async (args) => {
         const { serverFile, targetSrcDirectory, dryRun } = args;
-
         const resolvedServerPath = path.resolve(serverFile);
         const resolvedSrcDir = path.resolve(targetSrcDirectory);
+        const projectRoot = path.resolve(resolvedSrcDir, "..");
 
-        if (!fs.existsSync(resolvedServerPath)) return `[ERROR] Error: serverFile not found: "${resolvedServerPath}"`;
-        if (!fs.existsSync(resolvedSrcDir)) return `[ERROR] Error: src directory not found: "${resolvedSrcDir}"`;
+        return withMutationReport("inject_global_error_handler", dryRun ? null : projectRoot, async (report) => {
+            if (!fs.existsSync(resolvedServerPath)) throw new Error(`serverFile not found: "${resolvedServerPath}"`);
+            if (!fs.existsSync(resolvedSrcDir)) throw new Error(`src directory not found: "${resolvedSrcDir}"`);
 
-        const utilsDir = path.join(resolvedSrcDir, "utils");
-        const middlewareDir = path.join(resolvedSrcDir, "middleware");
+            const utilsDir = path.join(resolvedSrcDir, "utils");
+            const middlewareDir = path.join(resolvedSrcDir, "middleware");
+            const appErrorPath = path.join(utilsDir, "AppError.ts");
+            const errHandlerPath = path.join(middlewareDir, "errorHandler.ts");
 
-        const appErrorPath = path.join(utilsDir, "AppError.ts");
-        const errHandlerPath = path.join(middlewareDir, "errorHandler.ts");
+            if (fs.existsSync(appErrorPath)) throw new Error(`Guard: File exists: "${appErrorPath}"`);
+            if (fs.existsSync(errHandlerPath)) throw new Error(`Guard: File exists: "${errHandlerPath}"`);
 
-        if (fs.existsSync(appErrorPath)) return `[ERROR] Guard: File exists: "${appErrorPath}"`;
-        if (fs.existsSync(errHandlerPath)) return `[ERROR] Guard: File exists: "${errHandlerPath}"`;
+            const serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
+            const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
+            const appErrorContent = buildAppError();
+            const errHandlerContent = buildErrorHandler();
 
-        let serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
-        const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
-        const appErrorContent = buildAppError();
-        const errHandlerContent = buildErrorHandler();
+            if (dryRun) {
+                report.humanMessage =
+                    `[INFO] DRY RUN\n\n` +
+                    `--- PROPOSED: AppError.ts ---\n${appErrorContent}\n` +
+                    `--- PROPOSED: errorHandler.ts ---\n${errHandlerContent}\n` +
+                    `--- PROPOSED: server.ts ---\n${modifiedServer}\n`;
+                return;
+            }
 
-        if (dryRun) {
-            return (
-                `[INFO] DRY RUN\n\n` +
-                `--- PROPOSED: AppError.ts ---\n${appErrorContent}\n` +
-                `--- PROPOSED: errorHandler.ts ---\n${errHandlerContent}\n` +
-                `--- PROPOSED: server.ts ---\n${modifiedServer}\n`
-            );
-        }
+            if (!fs.existsSync(utilsDir)) fs.mkdirSync(utilsDir, { recursive: true });
+            if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
 
-        if (!fs.existsSync(utilsDir)) fs.mkdirSync(utilsDir, { recursive: true });
-        if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
+            fs.writeFileSync(appErrorPath, appErrorContent, "utf-8");
+            report.mutatedFiles.push(appErrorPath);
+            fs.writeFileSync(errHandlerPath, errHandlerContent, "utf-8");
+            report.mutatedFiles.push(errHandlerPath);
+            fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
+            report.mutatedFiles.push(resolvedServerPath);
 
-        fs.writeFileSync(appErrorPath, appErrorContent, "utf-8");
-        fs.writeFileSync(errHandlerPath, errHandlerContent, "utf-8");
-        fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
-
-        return `[SUCCESS] Global Error Handler injected successfully!\nFiles Created:\n  - ${appErrorPath}\n  - ${errHandlerPath}\nServer Updated:\n  - ${resolvedServerPath}`;
+            report.humanMessage = `[SUCCESS] Global Error Handler injected successfully!\nFiles Created:\n  - ${appErrorPath}\n  - ${errHandlerPath}\nServer Updated:\n  - ${resolvedServerPath}`;
+        });
     },
 };

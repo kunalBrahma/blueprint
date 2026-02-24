@@ -1,21 +1,22 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import { Project, Node } from "ts-morph";
+import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectSeederSchema = z.object({
-    targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
-    dryRun: z.boolean().default(false),
+  targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
+  dryRun: z.boolean().default(false),
 });
 
 type InjectSeederParams = typeof injectSeederSchema;
 
 function buildPlanSeeder(): string {
-    const project = new Project({ useInMemoryFileSystem: true });
-    const sourceFile = project.createSourceFile("seedPlans.ts", "", { overwrite: true });
+  const project = new Project({ useInMemoryFileSystem: true });
+  const sourceFile = project.createSourceFile("seedPlans.ts", "", { overwrite: true });
 
-    sourceFile.addStatements(`
+  sourceFile.addStatements(`
 import prisma from "../config/prisma";
 import { subscriptionService } from "../services/subscription/subscription.service";
 
@@ -28,10 +29,8 @@ async function main() {
   console.log("Seeding Subscriptions Plans...");
 
   for (const p of defaultPlans) {
-    // 1. Create the plan in the active provider mapping
     const gatewayPlanId = await subscriptionService.createPlan(p.name, p.amount, p.currency, p.interval);
     
-    // 2. Determine which ID field to store based on env constraint (or rely on generic metadata lookup)
     const isRazorpay = process.env.PAYMENT_PROVIDER === "razorpay";
     const updateData: any = {
       name: p.name,
@@ -46,7 +45,6 @@ async function main() {
       updateData.stripePriceId = gatewayPlanId;
     }
 
-    // 3. Upsert to Prisma DB (assuming plan.name is a sensible enough lookup, though realistically we might use ID)
     await prisma.plan.upsert({
        where: { id: "seed_" + p.name.toLowerCase() },
        create: { id: "seed_" + p.name.toLowerCase(), ...updateData },
@@ -67,44 +65,53 @@ main()
   });
 `.trimStart());
 
-    sourceFile.fixUnusedIdentifiers();
-    sourceFile.organizeImports();
-    return sourceFile.getFullText();
+  sourceFile.fixUnusedIdentifiers();
+  sourceFile.organizeImports();
+  return sourceFile.getFullText();
 }
 
 export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
-    name: "inject_plan_seeder",
-    description: "Generates an auto-seeder to automatically inject Pro/Premium stripe/razorpay plans into your gateway and sync them with your database.",
-    parameters: injectSeederSchema,
+  name: "inject_plan_seeder",
+  description: "Generates an auto-seeder to automatically inject Pro/Premium stripe/razorpay plans into your gateway and sync them with your database.",
+  parameters: injectSeederSchema,
 
-    execute: async (args) => {
-        const { targetSrcDirectory, dryRun } = args;
+  execute: async (args) => {
+    const { targetSrcDirectory, dryRun } = args;
+    const projectRoot = path.resolve(targetSrcDirectory, "..");
 
-        const scriptsDir = path.resolve(targetSrcDirectory, "scripts");
-        if (!fs.existsSync(scriptsDir)) {
-            fs.mkdirSync(scriptsDir, { recursive: true });
-        }
+    return withMutationReport("inject_plan_seeder", dryRun ? null : projectRoot, async (report) => {
+      const scriptsDir = path.resolve(targetSrcDirectory, "scripts");
+      if (!fs.existsSync(scriptsDir)) {
+        fs.mkdirSync(scriptsDir, { recursive: true });
+      }
 
-        const scriptPath = path.join(scriptsDir, "seedPlans.ts");
-        const content = buildPlanSeeder();
+      const scriptPath = path.join(scriptsDir, "seedPlans.ts");
+      const content = buildPlanSeeder();
 
-        if (dryRun) return `[INFO] DRY RUN:\n\${content}`;
+      if (dryRun) {
+        report.humanMessage = `[INFO] DRY RUN:\n${content}`;
+        return;
+      }
 
+      if (!fs.existsSync(scriptPath)) {
+        fs.writeFileSync(scriptPath, content, "utf-8");
+        report.mutatedFiles.push(scriptPath);
+      }
+
+      const pkgPath = path.resolve(targetSrcDirectory, "..", "package.json");
+      if (fs.existsSync(pkgPath)) {
         try {
-            if (!fs.existsSync(scriptPath)) fs.writeFileSync(scriptPath, content, "utf-8");
-
-            const pkgPath = path.resolve(targetSrcDirectory, "..", "package.json");
-            if (fs.existsSync(pkgPath)) {
-                const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-                pkg.scripts = pkg.scripts || {};
-                pkg.scripts["seed:plans"] = "ts-node src/scripts/seedPlans.ts";
-                fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), "utf-8");
-            }
-
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+          pkg.scripts = pkg.scripts || {};
+          pkg.scripts["seed:plans"] = "ts-node src/scripts/seedPlans.ts";
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), "utf-8");
+          report.mutatedFiles.push(pkgPath);
         } catch (err: unknown) {
-            return `[ERROR] Error writing file: \${err}`;
+          report.status = "PARTIAL_FAILURE";
         }
+      }
 
-        return `[SUCCESS] Plan Seeder auto-injected. Added "npm run seed:plans" to package.json.\\nFile: \${scriptPath}`;
-    },
+      report.humanMessage = `[SUCCESS] Plan Seeder auto-injected. Added "npm run seed:plans" to package.json.\nFile: ${scriptPath}`;
+    });
+  },
 };

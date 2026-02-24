@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 const injectStorageSchema = z.object({
@@ -28,12 +30,10 @@ import multer, { FileFilterCallback } from "multer";
 import { Request } from "express";
 import * as path from "node:path";
 
-// Define storage location based on environment (local vs cloud).
-// For Multer, we either use memory storage (for S3) or disk storage (for local).
 const useMemoryStorage = process.env.STORAGE_TYPE === "s3" || process.env.STORAGE_TYPE === "r2";
 
 const storage = useMemoryStorage
-  ? multer.memoryStorage() // Keep file in memory for streaming to S3
+  ? multer.memoryStorage()
   : multer.diskStorage({
       destination: (req, file, cb) => {
         cb(null, path.join(__dirname, "../../public/uploads/"));
@@ -45,7 +45,6 @@ const storage = useMemoryStorage
       },
     });
 
-// File filter for Images and PDFs
 const fileFilter = (req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
   const allowedMimeTypes = ["image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"];
   if (allowedMimeTypes.includes(file.mimetype)) {
@@ -58,7 +57,7 @@ const fileFilter = (req: Request, file: Express.Multer.File, cb: FileFilterCallb
 export const upload = multer({
   storage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
+    fileSize: 5 * 1024 * 1024,
   },
   fileFilter,
 });
@@ -102,17 +101,12 @@ export class StorageService implements IStorageService {
           accessKeyId: process.env.AWS_ACCESS_KEY_ID,
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
         },
-        endpoint: process.env.AWS_ENDPOINT_URL, // Optional: for R2 or DigitalOcean
-        forcePathStyle: !!process.env.AWS_ENDPOINT_URL, // Usually required for non-AWS S3-compatible APIs
+        endpoint: process.env.AWS_ENDPOINT_URL,
+        forcePathStyle: !!process.env.AWS_ENDPOINT_URL,
       });
     }
   }
 
-  /**
-   * Universal upload method.
-   * If using Multer memory storage (Cloud), it uploads the buffer to S3.
-   * If using Multer disk storage (Local), the file is already saved, it just returns the local path/URL.
-   */
   async uploadFile(file: Express.Multer.File): Promise<string> {
     try {
       if (this.isCloud && this.s3Client && this.bucketName) {
@@ -127,24 +121,18 @@ export class StorageService implements IStorageService {
           Key: fileName,
           Body: file.buffer,
           ContentType: file.mimetype,
-          // ACL: "public-read", // Uncomment if your bucket allows ACLs and you want public objects
         });
 
         await this.s3Client.send(command);
         
-        // Construct the URL. For AWS, it usually looks like this, but might differ for R2/Spaces.
-        // You might want to use a custom domain or CloudFront URL here.
         if (process.env.AWS_ENDPOINT_URL) {
-            // R2 / custom endpoint format
             return \`\${process.env.AWS_ENDPOINT_URL}/\${this.bucketName}/\${fileName}\`;
         }
         return \`https://\${this.bucketName}.s3.\${process.env.AWS_REGION}.amazonaws.com/\${fileName}\`;
       } else {
-        // Local strategy: File is already saved by Multer diskStorage
         if (!file.filename) {
             throw new Error("File name is missing. Ensure multer is using diskStorage for local uploads.");
         }
-        // Return a relative URL or path
         return \`/uploads/\${file.filename}\`;
       }
     } catch (error: unknown) {
@@ -156,8 +144,6 @@ export class StorageService implements IStorageService {
   async deleteFile(key: string): Promise<boolean> {
     try {
       if (this.isCloud && this.s3Client && this.bucketName) {
-         // Assuming 'key' might be a full URL if stored in DB, you might need to extract just the filename/key.
-         // This assumes 'key' passed in is just the object key.
          const command = new DeleteObjectCommand({
             Bucket: this.bucketName,
             Key: key,
@@ -165,8 +151,6 @@ export class StorageService implements IStorageService {
          await this.s3Client.send(command);
          return true;
       } else {
-         // Local delete
-         // Assuming 'key' is the relative URL like '/uploads/file.png'
          const filename = path.basename(key);
          const filePath = path.join(__dirname, "../../public/uploads/", filename);
          if (fs.existsSync(filePath)) {
@@ -183,7 +167,6 @@ export class StorageService implements IStorageService {
   }
 }
 
-// Export a singleton instance
 export const storageService = new StorageService();
 `.trimStart());
 
@@ -204,62 +187,55 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
 
   execute: async (args) => {
     const { targetSrcDirectory, dryRun } = args;
-
     const srcDir = path.resolve(targetSrcDirectory);
+    const projectRoot = path.resolve(srcDir, "..");
 
-    if (!fs.existsSync(srcDir)) {
-      return `[ERROR] Error: Source directory not found: "${srcDir}"`;
-    }
+    return withMutationReport("inject_storage_service", dryRun ? null : projectRoot, async (report) => {
+      if (!fs.existsSync(srcDir)) {
+        throw new Error(`Source directory not found: "${srcDir}"`);
+      }
 
-    const servicesDir = path.join(srcDir, "services");
-    const middlewareDir = path.join(srcDir, "middleware");
+      const servicesDir = path.join(srcDir, "services");
+      const middlewareDir = path.join(srcDir, "middleware");
+      const publicUploadsDir = path.join(srcDir, "../public/uploads");
 
-    // We also need public/uploads for local storage base structure
-    const publicUploadsDir = path.join(srcDir, "../public/uploads");
+      const storageServicePath = path.join(servicesDir, "storage.service.ts");
+      const multerMiddlewarePath = path.join(middlewareDir, "upload.ts");
 
-    const storageServicePath = path.join(servicesDir, "storage.service.ts");
-    const multerMiddlewarePath = path.join(middlewareDir, "upload.ts");
+      if (fs.existsSync(storageServicePath)) {
+        throw new Error(`Guard: File already exists: "${storageServicePath}". Refusing to overwrite.`);
+      }
+      if (fs.existsSync(multerMiddlewarePath)) {
+        throw new Error(`Guard: File already exists: "${multerMiddlewarePath}". Refusing to overwrite.`);
+      }
 
-    // Guard against overwriting
-    if (fs.existsSync(storageServicePath)) {
-      return `[ERROR] Guard: File already exists: "${storageServicePath}". Refusing to overwrite.`;
-    }
-    if (fs.existsSync(multerMiddlewarePath)) {
-      return `[ERROR] Guard: File already exists: "${multerMiddlewarePath}". Refusing to overwrite.`;
-    }
+      const storageCode = buildStorageService();
+      const multerCode = buildMulterMiddleware();
 
-    const storageCode = buildStorageService();
-    const multerCode = buildMulterMiddleware();
+      if (dryRun) {
+        const sep = "─".repeat(60);
+        report.humanMessage =
+          `[INFO] DRY RUN — No files were written.\n\n` +
+          `${sep}\nPROPOSED FILE: src/services/storage.service.ts\n${sep}\n` +
+          storageCode +
+          `\n${sep}\nPROPOSED FILE: src/middleware/upload.ts\n${sep}\n` +
+          multerCode +
+          `\n${sep}`;
+        return;
+      }
 
-    if (dryRun) {
-      const sep = "─".repeat(60);
-      return (
-        `[INFO] DRY RUN — No files were written.\n\n` +
-        `${sep}\nPROPOSED FILE: src/services/storage.service.ts\n${sep}\n` +
-        storageCode +
-        `\n${sep}\nPROPOSED FILE: src/middleware/upload.ts\n${sep}\n` +
-        multerCode +
-        `\n${sep}`
-      );
-    }
-
-    // Write to disk
-    try {
       if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
       if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
       if (!fs.existsSync(publicUploadsDir)) fs.mkdirSync(publicUploadsDir, { recursive: true });
 
       fs.writeFileSync(storageServicePath, storageCode, "utf-8");
+      report.mutatedFiles.push(storageServicePath);
       fs.writeFileSync(multerMiddlewarePath, multerCode, "utf-8");
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return `[ERROR] Error writing files: ${msg}`;
-    }
+      report.mutatedFiles.push(multerMiddlewarePath);
 
-    let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  multer @aws-sdk/client-s3`;
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(srcDir, "..");
+      let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  multer @aws-sdk/client-s3`;
+      try {
+        const cwd = projectRoot;
         if (fs.existsSync(path.join(cwd, "package.json"))) {
           const pkgs = ["multer", "@aws-sdk/client-s3"];
           const devPkgs = ["@types/multer", "@types/express"];
@@ -269,28 +245,23 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            const installCmd = `npm install ${need.join(" ")} --no-save --save-exact`;
-            execSync(installCmd, { cwd, stdio: "inherit" });
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
           }
           if (needDev.length > 0) {
-            const installCmd = `npm install -D ${needDev.join(" ")} --no-save --save-exact`;
-            execSync(installCmd, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
           }
+        }
+      } catch (err: unknown) {
+        packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install multer @aws-sdk/client-s3\n  npm install -D @types/multer @types/express`;
+        report.status = "PARTIAL_FAILURE";
       }
-    } catch (err: unknown) {
-      packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install multer @aws-sdk/client-s3\n  npm install -D @types/multer @types/express`;
-    }
-    const prismaWarnings = `\n\n[WARNING] Prisma Model Integration:\n  Consider adding a field to your models to store the file URL/Key.\n  e.g., \`avatarUrl String?\` or \`documentUrl String\``;
-    const localTestWarning = `\n\n[INFO] Remember to expose your public folder in Express for local uploads:\n  app.use("/uploads", express.static(path.join(__dirname, "../public/uploads")));`;
 
-    return (
-      `[SUCCESS] Storage Service and Middleware injected successfully!\n\n` +
-      `Generated Files:\n` +
-      `  • ${storageServicePath}\n` +
-      `  • ${multerMiddlewarePath}` +
-      packageWarnings +
-      prismaWarnings +
-      localTestWarning
-    );
+      report.humanMessage =
+        `[SUCCESS] Storage Service and Middleware injected successfully!\n\n` +
+        `Generated Files:\n` +
+        `  - ${storageServicePath}\n` +
+        `  - ${multerMiddlewarePath}` +
+        packageWarnings;
+    });
   },
 };

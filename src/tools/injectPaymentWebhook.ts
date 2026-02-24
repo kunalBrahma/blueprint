@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
-import { Project, Node } from "ts-morph";
+import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectPaymentWebhookSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -129,9 +131,7 @@ async function handleRazorpayEvent(req: Request, res: Response): Promise<void> {
   res.json({ status: "ok" });
 }
 
-// Unified resolver that dynamically chooses provider at runtime by inspecting headers
 export async function paymentWebhook(req: Request, res: Response): Promise<void> {
-  // Prefer explicit provider path or header, else fall back to signature detection
   const providerHint = (req.params.provider as string) || (req.headers["x-provider"] as string) || "";
 
   if (providerHint.toLowerCase() === "stripe" || req.headers["stripe-signature"]) {
@@ -142,7 +142,6 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
     return handleRazorpayEvent(req, res);
   }
 
-  // Unknown provider: attempt Stripe first (most common), then Razorpay
   try {
     return await handleStripeEvent(req, res);
   } catch (e) {
@@ -154,7 +153,6 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
   }
 }
 `.trimStart());
-  
 
   sourceFile.fixUnusedIdentifiers();
   sourceFile.organizeImports();
@@ -173,11 +171,7 @@ import { env } from "../config/env";
 
 const router = Router();
 
-// Unified webhook endpoint. Accepts optional provider param (e.g. /stripe, /razorpay)
-// and applies raw body parsing necessary for signature verification.
 router.post(["/", "/:provider"], express.raw({ type: "application/json" }), paymentWebhook);
-
-// Backwards-compatible explicit endpoints
 router.post("/stripe", express.raw({ type: "application/json" }), paymentWebhook);
 router.post("/razorpay", express.raw({ type: "application/json" }), paymentWebhook);
 
@@ -197,48 +191,53 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
   execute: async (args) => {
     const { targetSrcDirectory, dryRun } = args;
     const srcDir = path.resolve(targetSrcDirectory);
+    const projectRoot = path.resolve(srcDir, "..");
 
-    if (!fs.existsSync(srcDir)) {
-      return `[ERROR] Error: Directory not found: "${srcDir}"`;
-    }
-
-    const controllersDir = path.join(srcDir, "controllers");
-    const routesDir = path.join(srcDir, "routes");
-
-    if (!fs.existsSync(controllersDir)) fs.mkdirSync(controllersDir, { recursive: true });
-    if (!fs.existsSync(routesDir)) fs.mkdirSync(routesDir, { recursive: true });
-
-    const controllerPath = path.join(controllersDir, "webhook.controller.ts");
-    const routePath = path.join(routesDir, "webhook.routes.ts");
-
-    if (fs.existsSync(controllerPath)) return '[ERROR] Guard: ' + controllerPath + ' already exists.';
-
-    const controllerCode = buildWebhookController();
-    const routeCode = buildWebhookRoute();
-
-    if (dryRun) {
-      return `[INFO] DRY RUN\\n\\n--- webhook.controller.ts ---\\n` + controllerCode + '\\n\\n--- webhook.routes.ts ---\\n' + routeCode;
-    }
-
-    fs.writeFileSync(controllerPath, controllerCode, "utf-8");
-    fs.writeFileSync(routePath, routeCode, "utf-8");
-
-    let packageWarnings = "\\n\\n[SUCCESS] Packages automatically installed:\\n";
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(srcDir, "..");
-      if (fs.existsSync(path.join(cwd, "package.json"))) {
-        console.log("\\n[INFO] Auto-installing dependencies for Payment Webhooks...");
-        execSync("npm install stripe razorpay --no-save --save-exact", { cwd, stdio: "inherit" });
-        packageWarnings += "  stripe razorpay";
-        try {
-          recordInstalledPackages(cwd, ["stripe", "razorpay"]);
-        } catch (_) {}
+    return withMutationReport("inject_payment_webhook", dryRun ? null : projectRoot, async (report) => {
+      if (!fs.existsSync(srcDir)) {
+        throw new Error(`Directory not found: "${srcDir}"`);
       }
-    } catch (err: unknown) {
-      packageWarnings = "\\n\\n[WARNING] Failed to auto-install packages. Please manually run:\\n  npm install stripe razorpay";
-    }
 
-    return '[SUCCESS] Unified Subscriptions Webhook injected successfully!\\n\\nRemember to mount the router in server.ts:\\napp.use("/api/webhooks", webhookRoutes);' + packageWarnings;
+      const controllersDir = path.join(srcDir, "controllers");
+      const routesDir = path.join(srcDir, "routes");
+
+      if (!fs.existsSync(controllersDir)) fs.mkdirSync(controllersDir, { recursive: true });
+      if (!fs.existsSync(routesDir)) fs.mkdirSync(routesDir, { recursive: true });
+
+      const controllerPath = path.join(controllersDir, "webhook.controller.ts");
+      const routePath = path.join(routesDir, "webhook.routes.ts");
+
+      if (fs.existsSync(controllerPath)) throw new Error(`Guard: ${controllerPath} already exists.`);
+
+      const controllerCode = buildWebhookController();
+      const routeCode = buildWebhookRoute();
+
+      if (dryRun) {
+        report.humanMessage = `[INFO] DRY RUN\n\n--- webhook.controller.ts ---\n${controllerCode}\n\n--- webhook.routes.ts ---\n${routeCode}`;
+        return;
+      }
+
+      fs.writeFileSync(controllerPath, controllerCode, "utf-8");
+      report.mutatedFiles.push(controllerPath);
+      fs.writeFileSync(routePath, routeCode, "utf-8");
+      report.mutatedFiles.push(routePath);
+
+      let packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n";
+      try {
+        const cwd = projectRoot;
+        if (fs.existsSync(path.join(cwd, "package.json"))) {
+          execSync("npm install stripe razorpay --no-save --save-exact", { cwd, stdio: "inherit" });
+          packageWarnings += "  stripe razorpay";
+          try {
+            recordInstalledPackages(cwd, ["stripe", "razorpay"]);
+          } catch (_) { }
+        }
+      } catch (err: unknown) {
+        packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install stripe razorpay";
+        report.status = "PARTIAL_FAILURE";
+      }
+
+      report.humanMessage = `[SUCCESS] Unified Subscriptions Webhook injected successfully!\n\nRemember to mount the router in server.ts:\napp.use("/api/webhooks", webhookRoutes);${packageWarnings}`;
+    });
   },
 };

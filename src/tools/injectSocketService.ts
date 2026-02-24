@@ -1,9 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execSync } from "node:child_process";
 import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
+import { withMutationReport } from "../utils/mutationTracker.js";
 
 const injectSocketSchema = z.object({
   serverFile: z.string().describe("Absolute path to the main application file (server.ts / app.ts)"),
@@ -23,7 +25,6 @@ import { Server, Socket } from "socket.io";
 
 export class SocketService {
   private io?: Server;
-  // Queue holds actions requested before init() is called to avoid circular dependency
   private queuedActions: Array<() => void> = [];
 
   public init(server: HttpServer): void {
@@ -40,11 +41,8 @@ export class SocketService {
       socket.on("disconnect", () => {
         console.log("[INFO] Client disconnected [ID: " + socket.id + "]");
       });
-      
-      // Add custom event listeners here
     });
 
-    // Drain queued actions after initialization
     while (this.queuedActions.length > 0) {
       const act = this.queuedActions.shift();
       try {
@@ -65,7 +63,6 @@ export class SocketService {
       io.emit(event, data);
       return;
     }
-    // Queue emit until init
     this.queuedActions.push(() => {
       const i = this.getIOOrNull();
       if (i) i.emit(event, data);
@@ -91,7 +88,6 @@ export class SocketService {
       sock?.join(room);
       return;
     }
-    // Joining a room before init is not critical; enqueue a best-effort action
     this.queuedActions.push(() => {
       const i = this.getIOOrNull();
       if (i) {
@@ -114,7 +110,6 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   const project = new Project({ useInMemoryFileSystem: true });
   const sourceFile = project.createSourceFile(serverPath, serverContent, { overwrite: true });
 
-  // Ensure Imports
   const hasHttp = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "node:http" || imp.getModuleSpecifierValue() === "http");
   if (!hasHttp) {
     sourceFile.insertStatements(0, `import * as http from "node:http";`);
@@ -133,7 +128,6 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     sourceFile.insertStatements(idx, `import { socketService } from "${relImport}";`);
   }
 
-  // Find expressive app initialization usually `const app = express();`
   let appVarName = "app";
   let appInitIndex = -1;
   const stmts = sourceFile.getStatements();
@@ -150,15 +144,12 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     }
   });
 
-  // Check if `http.createServer` already exists
   const hasHttpCreate = stmts.some(stmt => stmt.getText().includes("http.createServer"));
 
   if (!hasHttpCreate && appInitIndex !== -1) {
-    // We inject the http server wrapping immediately after `const app = express();`
     sourceFile.insertStatements(appInitIndex + 1, `\n// Wrap Express app with HTTP server to support WebSockets\nconst server = http.createServer(${appVarName});\nsocketService.init(server);\n`);
   }
 
-  // Replace app.listen with server.listen
   stmts.forEach((stmt) => {
     if (!Node.isExpressionStatement(stmt)) return;
     const expr = stmt.getExpression();
@@ -168,8 +159,6 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     if (Node.isPropertyAccessExpression(callee) &&
       callee.getExpression().getText() === appVarName &&
       callee.getName() === "listen") {
-
-      // Replace `app.listen` with `server.listen`
       callee.getExpression().replaceWithText("server");
     }
   });
@@ -186,67 +175,68 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
 
   execute: async (args) => {
     const { serverFile, targetSrcDirectory, dryRun } = args;
-
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
+    const projectRoot = path.resolve(resolvedSrcDir, "..");
 
-    if (!fs.existsSync(resolvedServerPath)) return `[ERROR] Error: serverFile not found: "${resolvedServerPath}"`;
-    if (!fs.existsSync(resolvedSrcDir)) return `[ERROR] Error: src directory not found: "${resolvedSrcDir}"`;
+    return withMutationReport("inject_socket_service", dryRun ? null : projectRoot, async (report) => {
+      if (!fs.existsSync(resolvedServerPath)) throw new Error(`serverFile not found: "${resolvedServerPath}"`);
+      if (!fs.existsSync(resolvedSrcDir)) throw new Error(`src directory not found: "${resolvedSrcDir}"`);
 
-    const servicesDir = path.join(resolvedSrcDir, "services");
-    const socketPath = path.join(servicesDir, "socket.service.ts");
+      const servicesDir = path.join(resolvedSrcDir, "services");
+      const socketPath = path.join(servicesDir, "socket.service.ts");
 
-    if (fs.existsSync(socketPath)) return `[ERROR] Guard: File exists: "${socketPath}"`;
+      if (fs.existsSync(socketPath)) throw new Error(`Guard: File exists: "${socketPath}"`);
 
-    let serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
-    const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
-    const socketContent = buildSocketService();
+      const serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
+      const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
+      const socketContent = buildSocketService();
 
-    if (dryRun) {
-      return (
-        `[INFO] DRY RUN\n\n` +
-        `--- PROPOSED: socket.service.ts ---\n${socketContent}\n` +
-        `--- PROPOSED: ${serverFile} ---\n${modifiedServer}\n`
-      );
-    }
-
-    if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
-
-    fs.writeFileSync(socketPath, socketContent, "utf-8");
-    fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
-
-    let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  socket.io`;
-    try {
-      const execSync = require("node:child_process").execSync;
-      const cwd = path.resolve(resolvedSrcDir, "..");
-      if (fs.existsSync(path.join(cwd, "package.json"))) {
-        const pkgs = ["socket.io"];
-        const devPkgs = ["@types/socket.io"];
-        const pkgJsonPath = path.join(cwd, "package.json");
-        const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
-        const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
-        const need = pkgs.filter(p => !allDeps[p]);
-        const needDev = devPkgs.filter(p => !allDeps[p]);
-        if (need.length > 0) {
-          const installCmd = `npm install ${need.join(" ")} --no-save --save-exact`;
-          execSync(installCmd, { cwd, stdio: "inherit" });
-        }
-        if (needDev.length > 0) {
-          const installCmd = `npm install -D ${needDev.join(" ")} --no-save --save-exact`;
-          execSync(installCmd, { cwd, stdio: "inherit" });
-        }
-
-        // Record versions of installed SDKs for reproducibility
-        try {
-          recordInstalledPackages(cwd, [...pkgs, ...devPkgs]);
-        } catch (_) {
-          // best-effort
-        }
+      if (dryRun) {
+        report.humanMessage =
+          `[INFO] DRY RUN\n\n` +
+          `--- PROPOSED: socket.service.ts ---\n${socketContent}\n` +
+          `--- PROPOSED: ${serverFile} ---\n${modifiedServer}\n`;
+        return;
       }
-    } catch (err: unknown) {
-      packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install socket.io\n  npm install -D @types/socket.io`;
-    }
 
-    return `[SUCCESS] Socket Service injected successfully!` + packageWarnings;
+      if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
+
+      fs.writeFileSync(socketPath, socketContent, "utf-8");
+      report.mutatedFiles.push(socketPath);
+      fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
+      report.mutatedFiles.push(resolvedServerPath);
+
+      let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  socket.io`;
+      try {
+        const cwd = projectRoot;
+        if (fs.existsSync(path.join(cwd, "package.json"))) {
+          const pkgs = ["socket.io"];
+          const devPkgs = ["@types/socket.io"];
+          const pkgJsonPath = path.join(cwd, "package.json");
+          const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+          const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
+          const need = pkgs.filter(p => !allDeps[p]);
+          const needDev = devPkgs.filter(p => !allDeps[p]);
+          if (need.length > 0) {
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+          }
+          if (needDev.length > 0) {
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+          }
+
+          try {
+            recordInstalledPackages(cwd, [...pkgs, ...devPkgs]);
+          } catch (_) {
+            // best-effort
+          }
+        }
+      } catch (err: unknown) {
+        packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install socket.io\n  npm install -D @types/socket.io`;
+        report.status = "PARTIAL_FAILURE";
+      }
+
+      report.humanMessage = `[SUCCESS] Socket Service injected successfully!` + packageWarnings;
+    });
   },
 };
