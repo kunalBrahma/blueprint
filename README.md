@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-5.0%20(Telemetry)-blue?style=for-the-badge" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-4.1%20(Security_Audit)-blue?style=for-the-badge" alt="Version" />
   <img src="https://img.shields.io/badge/TypeScript-007ACC?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript" />
   <img src="https://img.shields.io/badge/Node.js-43853D?style=for-the-badge&logo=node.js&logoColor=white" alt="Node.js" />
   <img src="https://img.shields.io/badge/Prisma-3982CE?style=for-the-badge&logo=Prisma&logoColor=white" alt="Prisma" />
@@ -29,8 +29,9 @@
 1.  [What is Blueprint Architect?](#what-is-blueprint-architect)
 2.  [Architecture Overview](#architecture-overview)
 3.  [Mutation Telemetry System](#mutation-telemetry-system)
-4.  [Getting Started](#getting-started)
-5.  [Complete Tool Reference](#complete-tool-reference)
+4.  [Hardware-Tied Licensing](#hardware-tied-licensing)
+5.  [Getting Started](#getting-started)
+6.  [Complete Tool Reference](#complete-tool-reference)
     - [Project Scaffolding](#1-scaffold_project)
     - [Database & Schema](#2-inject_prisma_model)
     - [Routing & Controllers](#3-inject_express_route)
@@ -39,8 +40,8 @@
     - [Infrastructure Services](#11-inject_socket_service)
     - [Payments & Subscriptions](#14-inject_payment_webhook)
     - [Testing & Documentation](#18-inject_api_tests)
-6.  [Design Principles](#design-principles)
-7.  [Configuration Reference](#configuration-reference)
+7.  [Design Principles & Security](#design-principles--security)
+8.  [Configuration Reference](#configuration-reference)
 
 ---
 
@@ -76,7 +77,19 @@ Unlike simple code generators, Blueprint Architect:
 - **Reads before it writes.** Every AST mutation parses the existing file first, detecting conflicts, duplicate imports, and already-mounted middleware before making changes.
 - **Understands your schema.** When you add a `Booking` model referencing `User`, it automatically finds the `User` model and injects the inverse `bookings Booking[]` relation.
 - **Reports what it changed.** Every tool returns a machine-readable JSON mutation report with a correlation ID, list of mutated files, and TypeScript validation results — enabling upstream agents to reconcile and audit changes.
+- **Enterprise-Grade Safety.** Every disk write is isolated by a strict `PathJail` to prevent directory traversal (`../../`), and every mutation is snapshotted to guarantee a flawless 100% atomic rollback on intermediate failures.
 - **Never overwrites.** Guard clauses prevent overwriting existing files. Combined with `dryRun` mode, you always preview before committing.
+
+---
+
+## Hardware-Tied Licensing
+
+Blueprint Architect integrates a lightweight, zero-dependency licensing system via **Dodo Payments**.
+
+To use the Pro tools (like webhooks, sub systems, or auth generation), you must provide a valid `BLUEPRINT_LICENSE_KEY` in your environment variables. 
+The system validates the key against your machine's hardware ID (`os.hostname() + os.platform() + os.arch()`) and caches the result locally for 12 hours. This prevents rampant piracy while allowing you to code offline across network drops.
+
+If you don't have a key, the MCP gracefully downgrades and returns a purchase link directly to the AI agent.
 
 ---
 
@@ -739,7 +752,7 @@ Blueprint Architect exposes **20 tools**, organized by domain. Each tool accepts
 
 ---
 
-## Design Principles
+## Design Principles & Security
 
 ### 1. Read-Before-Write AST Injection
 Every tool that modifies existing code reads the file into a ts-morph `Project`, analyzes the AST, and makes targeted mutations. No blind string concatenation. No regex search-and-replace on logic.
@@ -747,17 +760,20 @@ Every tool that modifies existing code reads the file into a ts-morph `Project`,
 ### 2. Dry-Run First
 All 20 tools accept a `dryRun` parameter. When `true`, the tool returns the proposed file contents as text without touching the filesystem. This enables agents to preview and validate changes before committing.
 
-### 3. Universal Dependency Shield
+### 3. Path Jail & Filesystem Boundaries
+Every single `fs.writeFileSync`, `fs.mkdirSync`, and `fs.appendFileSync` across all 20 tools is protected by a strict `enforcePathJail` utility. The LLM mathematically cannot traverse outside the resolved `projectRoot` or use absolute paths to overwrite system files (`/etc/passwd`).
+
+### 4. Universal Dependency Shield
 Before installing any npm package, tools check `package.json` for existing dependencies. Only missing packages are installed using `--no-save --save-exact` to avoid manifest pollution. SDK versions are recorded in `SDK_VERSIONS.md` for reproducibility auditing.
 
-### 4. Atomic Operations with Rollback
-High-risk operations like `npx prisma generate` are wrapped with backup logic. On failure, the tool restores the original file and reports the error — the project is never left in a broken state.
+### 5. Atomic Rollbacks (`mutationTracker.ts`)
+High-risk operations like AST injection and `npx prisma generate` are wrapped in a mutation tracking engine. Before a file is touched, its exact buffer is snapshotted. If a tool fails halfway through scaffolding 4 files, the engine instantly **rolls back** all modified files to their original content and deletes any newly created files. Your project is never left in a broken, half-generated state.
 
-### 5. Schema Intelligence
+### 6. Schema Intelligence
 The Prisma model tool doesn't just append text. It understands relational gravity: if your `Booking` model has `userId String` with `relation: "User"`, the tool finds the `User` model and injects `bookings Booking[]` automatically.
 
-### 6. Guard Clauses
-Every tool that creates files checks for existing files first and refuses to overwrite them. This prevents accidental destruction of customized code.
+### 7. Guard Clauses & Execution Timeouts
+Every tool that creates files checks for existing files first and refuses to overwrite them. Furthermore, every shell execution (`npm install`, `npx prisma generate`) enforces a strict `timeout: 30000` to prevent indefinite hangs if the network stalls.
 
 ---
 

@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { z } from "zod";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -169,19 +170,22 @@ export const injectPrismaModel: Tool<
         const projectRoot = path.dirname(path.dirname(resolvedPath));
 
         return withMutationReport("inject_prisma_model", dryRun ? null : projectRoot, async (report) => {
+            // ── Path Jail: validate path ─────────────────────────────────────────
+            const safePath = enforcePathJail(projectRoot, resolvedPath);
+
             // ── Validate schemaPath ────────────────────────────────────────────────
-            if (!fs.existsSync(resolvedPath)) {
-                throw new Error(`File not found: "${resolvedPath}"`);
+            if (!fs.existsSync(safePath)) {
+                throw new Error(`File not found: "${safePath}"`);
             }
 
-            if (path.extname(resolvedPath) !== ".prisma") {
-                throw new Error(`Expected a .prisma file, got: "${path.extname(resolvedPath)}"`);
+            if (path.extname(safePath) !== ".prisma") {
+                throw new Error(`Expected a .prisma file, got: "${path.extname(safePath)}"`);
             }
 
             // ── Read current schema ────────────────────────────────────────────────
             let currentContent: string;
             try {
-                currentContent = fs.readFileSync(resolvedPath, "utf-8");
+                currentContent = fs.readFileSync(safePath, "utf-8");
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 throw new Error(`Error reading file: ${msg}`);
@@ -194,7 +198,7 @@ export const injectPrismaModel: Tool<
             );
             if (duplicatePattern.test(currentContent)) {
                 throw new Error(
-                    `Duplicate model detected: A model named "${modelName}" already exists in "${resolvedPath}". ` +
+                    `Duplicate model detected: A model named "${modelName}" already exists in "${safePath}". ` +
                     `Remove or rename it before injecting a new one.`
                 );
             }
@@ -248,7 +252,7 @@ export const injectPrismaModel: Tool<
                 const warningText = warnings.length ? `\nWARNINGS:\n${warnings.join("\n")}\n\n` : "";
                 report.humanMessage =
                     `[INFO] DRY RUN — No file was written.\n` +
-                    `Schema: ${resolvedPath}\n` +
+                    `Schema: ${safePath}\n` +
                     `Model:  ${modelName} (${fields.length} field${fields.length === 1 ? "" : "s"})\n` +
                     `${warningText}\n` +
                     `${separator}\n` +
@@ -293,9 +297,12 @@ export const injectPrismaModel: Tool<
                 modifiedSchema = modifiedSchema.replace(parentBlock, newParentBlock);
             }
 
+            // ── Snapshot + Write ──────────────────────────────────────────────────
+            report.snapshotFiles([safePath]);
+
             try {
-                fs.writeFileSync(resolvedPath, modifiedSchema, "utf-8");
-                report.mutatedFiles.push(resolvedPath);
+                fs.writeFileSync(safePath, modifiedSchema, "utf-8");
+                report.mutatedFiles.push(safePath);
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 throw new Error(`Error writing file: ${msg}`);
@@ -303,11 +310,11 @@ export const injectPrismaModel: Tool<
 
             let prismaWarning = "";
             try {
-                execSync("npx prisma generate", { stdio: "inherit", cwd: projectRoot });
+                execSync("npx prisma generate", { stdio: "inherit", cwd: projectRoot, timeout: 30000 });
             } catch (err) {
                 // Atomic rollback
                 try {
-                    fs.writeFileSync(resolvedPath, backup, "utf-8");
+                    fs.writeFileSync(safePath, backup, "utf-8");
                 } catch (_rollbackErr) {
                     throw new Error("Failed to run 'npx prisma generate' and rollback failed. Manual intervention required.");
                 }
@@ -329,7 +336,7 @@ export const injectPrismaModel: Tool<
 
             report.humanMessage =
                 `[SUCCESS] Model "${modelName}" successfully appended to:\n` +
-                `   ${resolvedPath}\n\n` +
+                `   ${safePath}\n\n` +
                 `Fields injected:\n${fieldSummary}\n\n` +
                 `Generated block:\n${"─".repeat(40)}\n${modelBlock}\n${"─".repeat(40)}` +
                 warningsText +

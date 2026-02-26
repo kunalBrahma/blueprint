@@ -6,6 +6,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectPaymentWebhookSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -194,12 +195,13 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
     const projectRoot = path.resolve(srcDir, "..");
 
     return withMutationReport("inject_payment_webhook", dryRun ? null : projectRoot, async (report) => {
-      if (!fs.existsSync(srcDir)) {
-        throw new Error(`Directory not found: "${srcDir}"`);
+      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      if (!fs.existsSync(safeSrcDir)) {
+        throw new Error(`Directory not found: "${safeSrcDir}"`);
       }
 
-      const controllersDir = path.join(srcDir, "controllers");
-      const routesDir = path.join(srcDir, "routes");
+      const controllersDir = path.join(safeSrcDir, "controllers");
+      const routesDir = path.join(safeSrcDir, "routes");
 
       if (!fs.existsSync(controllersDir)) fs.mkdirSync(controllersDir, { recursive: true });
       if (!fs.existsSync(routesDir)) fs.mkdirSync(routesDir, { recursive: true });
@@ -217,6 +219,9 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
         return;
       }
 
+      report.snapshotFiles([controllerPath, routePath]);
+
+
       fs.writeFileSync(controllerPath, controllerCode, "utf-8");
       report.mutatedFiles.push(controllerPath);
       fs.writeFileSync(routePath, routeCode, "utf-8");
@@ -226,7 +231,7 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
       try {
         const cwd = projectRoot;
         if (fs.existsSync(path.join(cwd, "package.json"))) {
-          execSync("npm install stripe razorpay --no-save --save-exact", { cwd, stdio: "inherit" });
+          execSync("npm install stripe razorpay --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
           packageWarnings += "  stripe razorpay";
           try {
             recordInstalledPackages(cwd, ["stripe", "razorpay"]);

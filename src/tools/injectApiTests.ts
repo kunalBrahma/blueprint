@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { z } from "zod";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectApiTestsSchema = z.object({
   targetRootDirectory: z.string().describe("Absolute path to the root directory (where package.json and src/ live)"),
@@ -65,16 +66,17 @@ export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
     const rootDir = path.resolve(targetRootDirectory);
 
     return withMutationReport("inject_api_tests", dryRun ? null : rootDir, async (report) => {
-      if (!fs.existsSync(rootDir)) {
-        throw new Error(`Root directory not found: "${rootDir}"`);
+      const safeRootDir = enforcePathJail(rootDir, path.resolve(targetRootDirectory));
+      if (!fs.existsSync(safeRootDir)) {
+        throw new Error(`Root directory not found: "${safeRootDir}"`);
       }
 
-      const testsDir = path.join(rootDir, "src", "__tests__");
+      const testsDir = path.join(safeRootDir, "src", "__tests__");
       if (!fs.existsSync(testsDir)) {
         fs.mkdirSync(testsDir, { recursive: true });
       }
 
-      const vitestConfigPath = path.join(rootDir, "vitest.config.ts");
+      const vitestConfigPath = path.join(safeRootDir, "vitest.config.ts");
       const authTestPath = path.join(testsDir, "auth.test.ts");
 
       if (fs.existsSync(authTestPath)) {
@@ -91,6 +93,8 @@ export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
       }
 
       if (!fs.existsSync(vitestConfigPath)) {
+        report.snapshotFiles([vitestConfigPath, authTestPath]);
+
         fs.writeFileSync(vitestConfigPath, vitestContent, "utf-8");
         report.mutatedFiles.push(vitestConfigPath);
       }
@@ -107,12 +111,13 @@ export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
           const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
           const need = pkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install -D ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
 
           pkgJson.scripts = pkgJson.scripts || {};
           if (!pkgJson.scripts.test) {
             pkgJson.scripts.test = "vitest run";
+            report.snapshotFiles([pkgJsonPath]);
             fs.writeFileSync(pkgJsonPath, JSON.stringify(pkgJson, null, 2), "utf-8");
             report.mutatedFiles.push(pkgJsonPath);
           }

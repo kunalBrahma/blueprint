@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectGlobalErrorSchema = z.object({
     serverFile: z.string().describe("Absolute path to the main application file (e.g. server.ts or app.ts)"),
@@ -100,13 +101,27 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     }
 
     let appVarName = "app";
+    const appCandidates: string[] = [];
     for (const varDecl of sourceFile.getVariableDeclarations()) {
         const init = varDecl.getInitializer();
         if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
-            appVarName = varDecl.getName();
-            break;
+            appCandidates.push(varDecl.getName());
         }
     }
+
+    if (appCandidates.length === 0) {
+        throw new Error(
+            `[AST Hard-Fail] No Express app declaration (e.g. "const app = express()") found in "${serverPath}". ` +
+            `Cannot determine where to mount the globalErrorHandler middleware.`
+        );
+    }
+    if (appCandidates.length > 1) {
+        throw new Error(
+            `[AST Hard-Fail] Ambiguous: ${appCandidates.length} Express app declarations found in "${serverPath}": ` +
+            `[${appCandidates.join(", ")}]. Cannot determine which to use.`
+        );
+    }
+    appVarName = appCandidates[0]!;
 
     const stmts = sourceFile.getStatements();
     let lastAppUseIndex = -1;
@@ -146,6 +161,7 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
         const { serverFile, targetSrcDirectory, dryRun } = args;
         const resolvedServerPath = path.resolve(serverFile);
         const resolvedSrcDir = path.resolve(targetSrcDirectory);
+        const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
         const projectRoot = path.resolve(resolvedSrcDir, "..");
 
         return withMutationReport("inject_global_error_handler", dryRun ? null : projectRoot, async (report) => {
@@ -176,6 +192,9 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
 
             if (!fs.existsSync(utilsDir)) fs.mkdirSync(utilsDir, { recursive: true });
             if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
+
+            report.snapshotFiles([appErrorPath, errHandlerPath, resolvedServerPath]);
+
 
             fs.writeFileSync(appErrorPath, appErrorContent, "utf-8");
             report.mutatedFiles.push(appErrorPath);

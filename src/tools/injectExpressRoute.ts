@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -137,7 +138,8 @@ function injectRoute(
     });
 
     // ── Step A: Find the router variable name ──────────────────────────────────
-    let routerVarName: string | undefined;
+    // HARD-FAIL: If multiple Router declarations exist, throw instead of guessing.
+    const routerCandidates: string[] = [];
 
     for (const varDecl of sourceFile.getVariableDeclarations()) {
         const init = varDecl.getInitializer();
@@ -150,17 +152,26 @@ function injectRoute(
             initText.startsWith("Router(") ||
             initText.startsWith("express(")
         ) {
-            routerVarName = varDecl.getName();
-            break;
+            routerCandidates.push(varDecl.getName());
         }
     }
 
-    if (!routerVarName) {
+    if (routerCandidates.length === 0) {
         throw new Error(
-            `No Express Router declaration found in "${filePath}". ` +
+            `[AST Hard-Fail] No Express Router declaration found in "${filePath}". ` +
             `Expected a variable initialized with express.Router(), Router(), or express().`
         );
     }
+
+    if (routerCandidates.length > 1) {
+        throw new Error(
+            `[AST Hard-Fail] Ambiguous: ${routerCandidates.length} Router declarations found in "${filePath}": ` +
+            `[${routerCandidates.join(", ")}]. ` +
+            `Cannot determine which router to inject into. Refactor the file to contain a single router.`
+        );
+    }
+
+    const routerVarName = routerCandidates[0]!;
 
     // ── Step B: Find insertion point ──────────────────────────────────────────
     const stmts = sourceFile.getStatements();
@@ -183,6 +194,27 @@ function injectRoute(
             routeCallIndices.push(i);
         }
     });
+
+    // ── HARD-FAIL: Duplicate route guard ─────────────────────────────────────
+    for (const idx of routeCallIndices) {
+        const stmt = stmts[idx]!;
+        if (!Node.isExpressionStatement(stmt)) continue;
+        const expr = stmt.getExpression();
+        if (!Node.isCallExpression(expr)) continue;
+        const callee = expr.getExpression();
+        if (!Node.isPropertyAccessExpression(callee)) continue;
+        if (callee.getName() !== method) continue;
+        const args = expr.getArguments();
+        if (args.length > 0) {
+            const firstArg = args[0]!;
+            if (Node.isStringLiteral(firstArg) && firstArg.getLiteralValue() === routePath) {
+                throw new Error(
+                    `[AST Hard-Fail] Duplicate route detected: ${method.toUpperCase()} "${routePath}" already exists in "${filePath}". ` +
+                    `Remove or rename the existing route before injecting a new one.`
+                );
+            }
+        }
+    }
 
     const newRouteText = buildRouteStatement(
         routerVarName,
@@ -341,32 +373,35 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
             // Fix 3: sanitize handler body to remove JSON-escaped quotes
             const handlerBody = sanitizeHandlerBody(args.handlerBody);
 
+            // ── Path Jail: validate all paths against project root ─────────────────
+            const safePath = enforcePathJail(projectRoot, resolvedPath);
+
             // ── Validate target file ───────────────────────────────────────────────
-            if (!fs.existsSync(resolvedPath)) {
-                throw new Error(`File not found: "${resolvedPath}"`);
+            if (!fs.existsSync(safePath)) {
+                throw new Error(`File not found: "${safePath}"`);
             }
 
-            const ext = path.extname(resolvedPath);
+            const ext = path.extname(safePath);
             if (!([".ts", ".js"].includes(ext))) {
                 throw new Error(`Target file must be a .ts or .js file. Got: "${ext}"`);
             }
 
             // ── Validate serverFile if provided ───────────────────────────────────
-            let resolvedServerPath: string | undefined;
+            let safeServerPath: string | undefined;
             if (serverFile) {
                 if (!mountPath) {
                     throw new Error(`"mountPath" is required when "serverFile" is provided.`);
                 }
-                resolvedServerPath = path.resolve(serverFile);
-                if (!fs.existsSync(resolvedServerPath)) {
-                    throw new Error(`serverFile not found: "${resolvedServerPath}"`);
+                safeServerPath = enforcePathJail(projectRoot, path.resolve(serverFile));
+                if (!fs.existsSync(safeServerPath)) {
+                    throw new Error(`serverFile not found: "${safeServerPath}"`);
                 }
             }
 
             // ── Read router file ───────────────────────────────────────────────────
             let originalContent: string;
             try {
-                originalContent = fs.readFileSync(resolvedPath, "utf-8");
+                originalContent = fs.readFileSync(safePath, "utf-8");
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 throw new Error(`Error reading file: ${msg}`);
@@ -377,7 +412,7 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
             try {
                 modifiedContent = injectRoute(
                     originalContent,
-                    resolvedPath,
+                    safePath,
                     method,
                     routePath,
                     handlerBody
@@ -390,17 +425,17 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
             // ── Wire into server.ts (if requested) ────────────────────────────────
             let modifiedServerContent: string | undefined;
 
-            if (resolvedServerPath && mountPath) {
+            if (safeServerPath && mountPath) {
                 const importName =
-                    routerImportName ?? deriveImportName(resolvedPath);
+                    routerImportName ?? deriveImportName(safePath);
 
                 try {
-                    const resolvedServerContent = fs.readFileSync(resolvedServerPath, "utf-8");
+                    const resolvedServerContent = fs.readFileSync(safeServerPath, "utf-8");
                     const warnings: string[] = [];
                     modifiedServerContent = wireRouteIntoServer(
                         resolvedServerContent,
-                        resolvedServerPath,
-                        resolvedPath,
+                        safeServerPath,
+                        safePath,
                         mountPath,
                         importName,
                         warnings
@@ -421,7 +456,7 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
                 const sep = "─".repeat(60);
                 let output =
                     `[INFO] DRY RUN — No files were written.\n` +
-                    `Router file: ${resolvedPath}\n` +
+                    `Router file: ${safePath}\n` +
                     `Route:       ${method.toUpperCase()} ${routePath}\n\n` +
                     `${sep}\nPROPOSED ROUTER FILE:\n${sep}\n` +
                     modifiedContent +
@@ -437,20 +472,24 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
                 return;
             }
 
-            // ── Write to disk ──────────────────────────────────────────────────────
+            // ── Snapshot + Write to disk ────────────────────────────────────────────
+            const filesToWrite = [safePath];
+            if (safeServerPath && modifiedServerContent) filesToWrite.push(safeServerPath);
+            report.snapshotFiles(filesToWrite);
+
             try {
-                fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
-                report.mutatedFiles.push(resolvedPath);
+                fs.writeFileSync(safePath, modifiedContent, "utf-8");
+                report.mutatedFiles.push(safePath);
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 throw new Error(`Error writing router file: ${msg}`);
             }
 
             let serverResult = "";
-            if (resolvedServerPath && modifiedServerContent) {
+            if (safeServerPath && modifiedServerContent) {
                 try {
-                    fs.writeFileSync(resolvedServerPath, modifiedServerContent, "utf-8");
-                    report.mutatedFiles.push(resolvedServerPath);
+                    fs.writeFileSync(safeServerPath, modifiedServerContent, "utf-8");
+                    report.mutatedFiles.push(safeServerPath);
                     serverResult = `\n[SUCCESS] server.ts updated: app.use("${mountPath}", ...) added.`;
                 } catch (err: unknown) {
                     const msg = err instanceof Error ? err.message : String(err);
@@ -461,7 +500,7 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
 
             report.humanMessage =
                 `[SUCCESS] Route injected successfully.\n\n` +
-                `File:   ${resolvedPath}\n` +
+                `File:   ${safePath}\n` +
                 `Route:  ${method.toUpperCase()} ${routePath}` +
                 serverResult +
                 `\n\nThe handler was inserted after the last existing router.${method}() call ` +

@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 const injectStorageSchema = z.object({
@@ -191,13 +192,14 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
     const projectRoot = path.resolve(srcDir, "..");
 
     return withMutationReport("inject_storage_service", dryRun ? null : projectRoot, async (report) => {
-      if (!fs.existsSync(srcDir)) {
-        throw new Error(`Source directory not found: "${srcDir}"`);
+      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      if (!fs.existsSync(safeSrcDir)) {
+        throw new Error(`Directory not found: "${safeSrcDir}"`);
       }
 
-      const servicesDir = path.join(srcDir, "services");
-      const middlewareDir = path.join(srcDir, "middleware");
-      const publicUploadsDir = path.join(srcDir, "../public/uploads");
+      const servicesDir = path.join(safeSrcDir, "services");
+      const middlewareDir = path.join(safeSrcDir, "middleware");
+      const publicUploadsDir = path.resolve(safeSrcDir, "../public/uploads");
 
       const storageServicePath = path.join(servicesDir, "storage.service.ts");
       const multerMiddlewarePath = path.join(middlewareDir, "upload.ts");
@@ -228,6 +230,9 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
       if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
       if (!fs.existsSync(publicUploadsDir)) fs.mkdirSync(publicUploadsDir, { recursive: true });
 
+      report.snapshotFiles([storageServicePath, multerMiddlewarePath]);
+
+
       fs.writeFileSync(storageServicePath, storageCode, "utf-8");
       report.mutatedFiles.push(storageServicePath);
       fs.writeFileSync(multerMiddlewarePath, multerCode, "utf-8");
@@ -245,10 +250,10 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
         }
       } catch (err: unknown) {

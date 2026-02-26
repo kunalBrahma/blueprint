@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -232,13 +233,15 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_transaction", dryRun ? null : projectRoot, async (report) => {
+            const safePath = enforcePathJail(projectRoot, resolvedPath);
+
             // ── 1. Read or Create File ──────────────────────────────────────────────
             let fileContent = "";
             let isNewFile = false;
 
-            if (fs.existsSync(resolvedPath)) {
+            if (fs.existsSync(safePath)) {
                 try {
-                    fileContent = fs.readFileSync(resolvedPath, "utf-8");
+                    fileContent = fs.readFileSync(safePath, "utf-8");
                 } catch (err: unknown) {
                     const msg = err instanceof Error ? err.message : String(err);
                     throw new Error(`Error reading file: ${msg}`);
@@ -253,14 +256,14 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
                 compilerOptions: { allowJs: true },
             });
 
-            const sourceFile = project.createSourceFile(resolvedPath, fileContent, {
+            const sourceFile = project.createSourceFile(safePath, fileContent, {
                 overwrite: true,
             });
 
             // ── 3. Guard against overwriting ───────────────────────────────────────
             if (!isNewFile && hasFunction(sourceFile, functionName)) {
                 throw new Error(
-                    `Guard Triggered: Function "${functionName}" already exists in ${resolvedPath}.\n` +
+                    `Guard Triggered: Function "${functionName}" already exists in ${safePath}.\n` +
                     `Refusing to overwrite. Please delete it manually or choose a different functionName.`
                 );
             }
@@ -279,7 +282,7 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
                 const sep = "─".repeat(60);
                 report.humanMessage =
                     `[INFO] DRY RUN — No file was written.\n` +
-                    `File:     ${resolvedPath} ${isNewFile ? "(NEW)" : "(EXISTING)"}\n` +
+                    `File:     ${safePath} ${isNewFile ? "(NEW)" : "(EXISTING)"}\n` +
                     `Function: ${functionName}\n\n` +
                     `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
                     sourceFile.getFullText() +
@@ -287,20 +290,30 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
                 return;
             }
 
-            // ── 7. Write to Disk ───────────────────────────────────────────────────
+            // ── 7. Snapshot + Write to Disk ───────────────────────────────────────
+            const filesToSnapshot = [safePath];
             if (isNewFile) {
-                fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+                fs.mkdirSync(path.dirname(safePath), { recursive: true });
             }
-            fs.writeFileSync(resolvedPath, sourceFile.getFullText(), "utf-8");
-            report.mutatedFiles.push(resolvedPath);
 
-            // Build helper service if Razorpay is detected
+            // Check for payment service helper
+            let servicePath: string | undefined;
             if (transactionLogic.includes("paymentService") || transactionLogic.includes("Razorpay") || transactionLogic.includes("razorpay")) {
-                const servicesDir = path.resolve(path.dirname(resolvedPath), "../services");
+                const servicesDir = enforcePathJail(projectRoot, path.resolve(path.dirname(safePath), "../services"));
                 if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
-                const servicePath = path.join(servicesDir, "payment.service.ts");
+                servicePath = path.join(servicesDir, "payment.service.ts");
                 if (!fs.existsSync(servicePath)) {
-                    const serviceCode = `
+                    filesToSnapshot.push(servicePath);
+                }
+            }
+
+            report.snapshotFiles(filesToSnapshot);
+
+            fs.writeFileSync(safePath, sourceFile.getFullText(), "utf-8");
+            report.mutatedFiles.push(safePath);
+
+            if (servicePath && !fs.existsSync(servicePath)) {
+                const serviceCode = `
 import Razorpay from "razorpay";
 import { env } from "../config/env";
 
@@ -319,14 +332,13 @@ export const paymentService = {
   }
 };
 `.trimStart();
-                    fs.writeFileSync(servicePath, serviceCode, "utf-8");
-                    report.mutatedFiles.push(servicePath);
-                }
+                fs.writeFileSync(servicePath, serviceCode, "utf-8");
+                report.mutatedFiles.push(servicePath);
             }
 
             let resultMsg =
                 `[SUCCESS] Transaction shell injected successfully!\n\n` +
-                `File:     ${resolvedPath}\n` +
+                `File:     ${safePath}\n` +
                 `Function: ${functionName}\n\n` +
                 `The logic you provided has been cleanly wrapped inside a \`prisma.$transaction\` block ` +
                 `with Express req/res handling.`;

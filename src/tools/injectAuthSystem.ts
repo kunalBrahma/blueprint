@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -424,13 +425,14 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
     const projectRoot = path.resolve(controllersDir, "../..");
 
     return withMutationReport("inject_auth_system", dryRun ? null : projectRoot, async (report) => {
-      const utilsDir = path.resolve(controllersDir, "../utils");
+      const safeControllersDir = enforcePathJail(projectRoot, controllersDir);
+      const utilsDir = path.resolve(safeControllersDir, "../utils");
 
-      if (!fs.existsSync(controllersDir)) {
-        throw new Error(`Controllers directory not found: "${controllersDir}"`);
+      if (!fs.existsSync(safeControllersDir)) {
+        throw new Error(`Controllers directory not found: "${safeControllersDir}"`);
       }
 
-      const controllerPath = path.join(controllersDir, "auth.controller.ts");
+      const controllerPath = path.join(safeControllersDir, "auth.controller.ts");
       const utilsPath = path.join(utilsDir, "auth.ts");
 
       if (fs.existsSync(controllerPath)) {
@@ -459,6 +461,9 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
         fs.mkdirSync(utilsDir, { recursive: true });
       }
 
+      report.snapshotFiles([utilsPath, controllerPath]);
+
+
       fs.writeFileSync(utilsPath, authUtilsCode, "utf-8");
       report.mutatedFiles.push(utilsPath);
       fs.writeFileSync(controllerPath, authControllerCode, "utf-8");
@@ -476,10 +481,10 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
           if (authProviders.includes("google")) {
             const authPkgs = ["passport", "passport-google-oauth20"];
@@ -488,10 +493,10 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
             const needAuth = authPkgs.filter(p => !allDeps2[p]);
             const needAuthDev = authDev.filter(p => !allDeps2[p]);
             if (needAuth.length > 0) {
-              execSync(`npm install ${needAuth.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+              execSync(`npm install ${needAuth.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
             }
             if (needAuthDev.length > 0) {
-              execSync(`npm install -D ${needAuthDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+              execSync(`npm install -D ${needAuthDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
             }
             packageWarnings += `\n  passport passport-google-oauth20`;
           }

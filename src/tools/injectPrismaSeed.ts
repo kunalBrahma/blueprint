@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectSeedSchema = z.object({
   prismaDirectory: z.string().describe("Absolute path to the prisma folder (where schema.prisma lives)"),
@@ -87,6 +88,7 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
     const projectRoot = path.resolve(resolvedPath, "..");
 
     return withMutationReport("inject_prisma_seed", dryRun ? null : projectRoot, async (report) => {
+      const safePath = enforcePathJail(projectRoot, resolvedPath);
       if (!fs.existsSync(resolvedPath)) {
         throw new Error(`Prisma directory not found: "${resolvedPath}"`);
       }
@@ -109,14 +111,17 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
       try {
         const cwd = projectRoot;
         if (fs.existsSync(packageJsonPath)) {
-          execSync("npm install bcrypt --no-save --save-exact", { cwd, stdio: "inherit" });
-          execSync("npm install -D ts-node @types/bcrypt @types/node --no-save --save-exact", { cwd, stdio: "inherit" });
+          execSync("npm install bcrypt --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
+          execSync("npm install -D ts-node @types/bcrypt @types/node --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
           packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n  bcrypt, ts-node, @types/bcrypt";
         }
       } catch (err: unknown) {
         packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install bcrypt\n  npm install -D ts-node @types/bcrypt";
         report.status = "PARTIAL_FAILURE";
       }
+
+      report.snapshotFiles([seedPath]);
+
 
       fs.writeFileSync(seedPath, seedCode, "utf-8");
       report.mutatedFiles.push(seedPath);
@@ -126,6 +131,7 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
           const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
           if (!pkg.prisma) pkg.prisma = {};
           pkg.prisma.seed = "ts-node prisma/seed.ts";
+          report.snapshotFiles([packageJsonPath]);
           fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2), "utf-8");
           report.mutatedFiles.push(packageJsonPath);
         } catch (e) { }

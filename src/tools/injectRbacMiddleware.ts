@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 // ─── 1. Constants ──────────────────────────────────────────────────────────────
 
@@ -196,18 +197,20 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_rbac_middleware", dryRun ? null : projectRoot, async (report) => {
-            if (!fs.existsSync(resolvedPath)) {
-                throw new Error(`File not found: "${resolvedPath}"`);
+            const safePath = enforcePathJail(projectRoot, resolvedPath);
+
+            if (!fs.existsSync(safePath)) {
+                throw new Error(`File not found: "${safePath}"`);
             }
 
-            const ext = path.extname(resolvedPath);
+            const ext = path.extname(safePath);
             if (![".ts", ".js"].includes(ext)) {
                 throw new Error(`Target must be a .ts or .js file. Got: "${ext}"`);
             }
 
             let originalContent: string;
             try {
-                originalContent = fs.readFileSync(resolvedPath, "utf-8");
+                originalContent = fs.readFileSync(safePath, "utf-8");
             } catch (err: unknown) {
                 const msg = err instanceof Error ? err.message : String(err);
                 throw new Error(`Error reading file: ${msg}`);
@@ -218,7 +221,7 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
 
             ({ result: modifiedContent, action } = injectRbac(
                 originalContent,
-                resolvedPath,
+                safePath,
                 method,
                 routePath,
                 allowedRoles
@@ -228,7 +231,7 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 const sep = "─".repeat(60);
                 report.humanMessage =
                     `[INFO] DRY RUN — No file was written.\n` +
-                    `File:    ${resolvedPath}\n` +
+                    `File:    ${safePath}\n` +
                     `Route:   ${method.toUpperCase()} ${routePath}\n` +
                     `Roles:   [${allowedRoles.join(", ")} ]\n` +
                     `Middleware: ${action}\n\n` +
@@ -238,12 +241,13 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 return;
             }
 
-            fs.writeFileSync(resolvedPath, modifiedContent, "utf-8");
-            report.mutatedFiles.push(resolvedPath);
+            report.snapshotFiles([safePath]);
+            fs.writeFileSync(safePath, modifiedContent, "utf-8");
+            report.mutatedFiles.push(safePath);
 
             report.humanMessage =
                 `[SUCCESS] RBAC secured successfully.\n\n` +
-                `File:    ${resolvedPath}\n` +
+                `File:    ${safePath}\n` +
                 `Route:   ${method.toUpperCase()} ${routePath}\n` +
                 `Roles:   [${allowedRoles.join(", ")}]\n\n` +
                 `Middleware: ${action}\n\n` +

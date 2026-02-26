@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectMailSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -95,6 +96,7 @@ function updateAuthController(targetSrcDirectory: string, report: { mutatedFiles
 
     sourceFile.fixUnusedIdentifiers();
     sourceFile.organizeImports();
+
     fs.writeFileSync(authControllerPath, sourceFile.getFullText(), "utf-8");
     report.mutatedFiles.push(authControllerPath);
     return "[SUCCESS] AST Integration: Replaced console placeholder with actual mailService.sendEmail() in auth.controller.ts.";
@@ -110,7 +112,8 @@ export const injectMailProvider: Tool<FastMCPSessionAuth, InjectMailParams> = {
         const projectRoot = path.resolve(targetSrcDirectory, "..");
 
         return withMutationReport("inject_mail_provider", dryRun ? null : projectRoot, async (report) => {
-            const servicesDir = path.resolve(targetSrcDirectory, "services");
+            const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+            const servicesDir = path.resolve(safeSrcDir, "services");
             if (!fs.existsSync(servicesDir)) {
                 fs.mkdirSync(servicesDir, { recursive: true });
             }
@@ -127,16 +130,22 @@ export const injectMailProvider: Tool<FastMCPSessionAuth, InjectMailParams> = {
                 return;
             }
 
+            report.snapshotFiles([filePath]);
             fs.writeFileSync(filePath, content, "utf-8");
             report.mutatedFiles.push(filePath);
 
-            const astResult = updateAuthController(targetSrcDirectory, report);
+            // Snapshot auth controller if it exists (before AST mutation)
+            const authControllerPath = path.resolve(safeSrcDir, "controllers/auth.controller.ts");
+            if (fs.existsSync(authControllerPath)) {
+                report.snapshotFiles([authControllerPath]);
+            }
+            const astResult = updateAuthController(safeSrcDir, report);
 
             let packageWarnings = "\n\n[SUCCESS] Packages automatically installed:\n  resend";
             try {
                 const cwd = projectRoot;
                 if (fs.existsSync(path.join(cwd, "package.json"))) {
-                    execSync("npm install resend --no-save --save-exact", { cwd, stdio: "inherit" });
+                    execSync("npm install resend --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
                 }
             } catch (err: unknown) {
                 packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install resend";

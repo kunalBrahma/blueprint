@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectCrudSchema = z.object({
   modelName: z.string().regex(/^[A-Z][a-zA-Z0-9]*$/, "modelName must be PascalCase"),
@@ -254,24 +255,28 @@ export const injectCrudController: Tool<FastMCPSessionAuth, InjectCrudParams> = 
     const projectRoot = path.resolve(resolvedDir, "../..");
 
     return withMutationReport("inject_crud_controller", dryRun ? null : projectRoot, async (report) => {
-      if (!fs.existsSync(resolvedDir)) throw new Error(`Directory not found: "${resolvedDir}"`);
+      const safeDir = enforcePathJail(projectRoot, resolvedDir);
+      if (!fs.existsSync(safeDir)) throw new Error(`Directory not found: "${safeDir}"`);
 
       const fileName = `${toCamel(modelName)}.controller.ts`;
-      const outputPath = path.join(resolvedDir, fileName);
+      const outputPath = path.join(safeDir, fileName);
 
       if (fs.existsSync(outputPath)) {
         throw new Error(`File already exists: "${outputPath}".`);
       }
 
-      const hasStorage = fs.existsSync(path.join(resolvedDir, "../middleware/upload.ts"));
+      const hasStorage = fs.existsSync(path.join(safeDir, "../middleware/upload.ts"));
 
-      const content = buildCrudController(modelName, hasStorage, resolvedDir);
+      const content = buildCrudController(modelName, hasStorage, safeDir);
 
       if (dryRun) {
         const sep = "─".repeat(60);
         report.humanMessage = `[INFO] DRY RUN\n${sep}\n${content}\n${sep}`;
         return;
       }
+
+      report.snapshotFiles([outputPath]);
+
 
       fs.writeFileSync(outputPath, content, "utf-8");
       report.mutatedFiles.push(outputPath);

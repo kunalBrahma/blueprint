@@ -6,6 +6,7 @@ import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectSocketSchema = z.object({
   serverFile: z.string().describe("Absolute path to the main application file (server.ts / app.ts)"),
@@ -130,6 +131,7 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
 
   let appVarName = "app";
   let appInitIndex = -1;
+  const appCandidates: { name: string; index: number }[] = [];
   const stmts = sourceFile.getStatements();
 
   stmts.forEach((stmt, i) => {
@@ -137,12 +139,26 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
       stmt.getDeclarations().forEach(decl => {
         const init = decl.getInitializer();
         if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
-          appVarName = decl.getName();
-          appInitIndex = i;
+          appCandidates.push({ name: decl.getName(), index: i });
         }
       });
     }
   });
+
+  if (appCandidates.length === 0) {
+    throw new Error(
+      `[AST Hard-Fail] No Express app declaration (e.g. "const app = express()") found in "${serverPath}". ` +
+      `Cannot determine where to inject HTTP server wrapping.`
+    );
+  }
+  if (appCandidates.length > 1) {
+    throw new Error(
+      `[AST Hard-Fail] Ambiguous: ${appCandidates.length} Express app declarations found in "${serverPath}": ` +
+      `[${appCandidates.map(c => c.name).join(", ")}]. Cannot determine which to use.`
+    );
+  }
+  appVarName = appCandidates[0]!.name;
+  appInitIndex = appCandidates[0]!.index;
 
   const hasHttpCreate = stmts.some(stmt => stmt.getText().includes("http.createServer"));
 
@@ -177,6 +193,7 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
     const { serverFile, targetSrcDirectory, dryRun } = args;
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
+    const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
     const projectRoot = path.resolve(resolvedSrcDir, "..");
 
     return withMutationReport("inject_socket_service", dryRun ? null : projectRoot, async (report) => {
@@ -202,6 +219,9 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
 
       if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
 
+      report.snapshotFiles([socketPath, resolvedServerPath]);
+
+
       fs.writeFileSync(socketPath, socketContent, "utf-8");
       report.mutatedFiles.push(socketPath);
       fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
@@ -219,10 +239,10 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
 
           try {

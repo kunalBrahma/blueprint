@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectRedisSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -52,7 +53,8 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_redis_service", dryRun ? null : projectRoot, async (report) => {
-      const servicesDir = path.resolve(targetSrcDirectory, "services");
+      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const servicesDir = path.resolve(safeSrcDir, "services");
       if (!fs.existsSync(servicesDir)) {
         fs.mkdirSync(servicesDir, { recursive: true });
       }
@@ -70,6 +72,9 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
         return;
       }
 
+      report.snapshotFiles([filePath]);
+
+
       fs.writeFileSync(filePath, content, "utf-8");
       report.mutatedFiles.push(filePath);
 
@@ -77,7 +82,7 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
       try {
         const cwd = projectRoot;
         if (fs.existsSync(path.join(cwd, "package.json"))) {
-          execSync("npm install ioredis express-rate-limit rate-limit-redis --no-save --save-exact", { cwd, stdio: "inherit" });
+          execSync("npm install ioredis express-rate-limit rate-limit-redis --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
         }
       } catch (err: unknown) {
         packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install ioredis express-rate-limit rate-limit-redis";

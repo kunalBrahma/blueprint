@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectEnvSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -80,7 +81,8 @@ export const injectEnvValidation: Tool<FastMCPSessionAuth, InjectEnvParams> = {
         const projectRoot = path.resolve(targetSrcDirectory, "..");
 
         return withMutationReport("inject_env_validation", dryRun ? null : projectRoot, async (report) => {
-            const configDir = path.resolve(targetSrcDirectory, "config");
+            const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+            const configDir = path.resolve(safeSrcDir, "config");
             const filePath = path.join(configDir, "env.ts");
             const envFilePath = path.join(projectRoot, ".env");
 
@@ -115,6 +117,9 @@ CORS_ORIGIN=*
                 report.humanMessage = code;
                 return;
             }
+
+            report.snapshotFiles([filePath]);
+
 
             fs.writeFileSync(filePath, code, "utf-8");
             report.mutatedFiles.push(filePath);

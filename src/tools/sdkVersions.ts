@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 export function recordInstalledPackages(projectRoot: string, packages: string[]): void {
   try {
@@ -19,13 +20,17 @@ export function recordInstalledPackages(projectRoot: string, packages: string[])
     lines.push("");
 
     const outPath = path.join(projectRoot, "SDK_VERSIONS.md");
+    enforcePathJail(path.resolve(projectRoot), outPath);
     // Append to file for history
     fs.appendFileSync(outPath, lines.join("\n") + "\n", "utf-8");
   } catch (err) {
     // Best-effort: do not throw from tooling
     try {
       const outPath = path.join(projectRoot, "SDK_VERSIONS.md");
+      enforcePathJail(path.resolve(projectRoot), outPath);
       fs.appendFileSync(outPath, `# SDK Versions — record failed: ${String(err)}\n`, "utf-8");
-    } catch {}
+    } catch (innerErr) {
+      console.error("[sdkVersions] Failed to write SDK version fallback:", innerErr);
+    }
   }
 }

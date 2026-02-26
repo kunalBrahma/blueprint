@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const generateDocsSchema = z.object({
   serverFile: z.string().describe("Absolute path to the main application file (server.ts / app.ts)"),
@@ -87,13 +88,27 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   }
 
   let appVarName = "app";
+  const appCandidates: string[] = [];
   for (const varDecl of sourceFile.getVariableDeclarations()) {
     const init = varDecl.getInitializer();
     if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
-      appVarName = varDecl.getName();
-      break;
+      appCandidates.push(varDecl.getName());
     }
   }
+
+  if (appCandidates.length === 0) {
+    throw new Error(
+      `[AST Hard-Fail] No Express app declaration (e.g. "const app = express()") found in "${serverPath}". ` +
+      `Cannot determine where to mount the /api-docs route.`
+    );
+  }
+  if (appCandidates.length > 1) {
+    throw new Error(
+      `[AST Hard-Fail] Ambiguous: ${appCandidates.length} Express app declarations found in "${serverPath}": ` +
+      `[${appCandidates.join(", ")}]. Cannot determine which to use.`
+    );
+  }
+  appVarName = appCandidates[0]!;
 
   const swaggerRoute = `/api-docs`;
   const useStmt = `\n// Serve Swagger API Documentation\n${appVarName}.use("${swaggerRoute}", swaggerUi.serve, swaggerUi.setup(swaggerSpec));\n`;
@@ -133,6 +148,7 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
     const { serverFile, targetSrcDirectory, dryRun } = args;
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
+    const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
     const projectRoot = path.resolve(resolvedSrcDir, "..");
 
     return withMutationReport("generate_api_docs", dryRun ? null : projectRoot, async (report) => {
@@ -158,6 +174,9 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
 
       if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
 
+      report.snapshotFiles([swaggerPath, resolvedServerPath]);
+
+
       fs.writeFileSync(swaggerPath, swaggerContent, "utf-8");
       report.mutatedFiles.push(swaggerPath);
       fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
@@ -175,10 +194,10 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
           }
         }
       } catch (err: unknown) {

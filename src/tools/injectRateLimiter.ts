@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectRateLimiterSchema = z.object({
     targetFile: z.string().describe("Absolute path to the Express router file (e.g. auth.routes.ts)"),
@@ -25,6 +26,7 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_rate_limiter", dryRun ? null : projectRoot, async (report) => {
+            const safePath = enforcePathJail(projectRoot, resolvedPath);
             if (!fs.existsSync(resolvedPath)) {
                 throw new Error(`File not found: "${resolvedPath}"`);
             }
@@ -91,16 +93,19 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
                     const need = pkgs.filter(p => !allDeps[p]);
                     const needDev = devPkgs.filter(p => !allDeps[p]);
                     if (need.length > 0) {
-                        execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+                        execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
                     }
                     if (needDev.length > 0) {
-                        execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit" });
+                        execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
                     }
                 }
             } catch (err: unknown) {
                 packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install express-rate-limit rate-limit-redis ioredis\n  npm install -D @types/express-rate-limit`;
                 report.status = "PARTIAL_FAILURE";
             }
+
+            report.snapshotFiles([resolvedPath]);
+
 
             fs.writeFileSync(resolvedPath, sourceFile.getFullText(), "utf-8");
             report.mutatedFiles.push(resolvedPath);

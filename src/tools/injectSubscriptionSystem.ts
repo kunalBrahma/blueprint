@@ -5,6 +5,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectSubscriptionSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -21,16 +22,31 @@ function updatePrismaSchema(targetSrcDirectory: string, report: { mutatedFiles: 
 
   let schemaContent = fs.readFileSync(schemaPath, "utf-8");
 
-  if (schemaContent.includes("model User")) {
-    const userBlockRegex = /(model\s+User\s+\{[^}]*?)(\n\})/;
-    const match = schemaContent.match(userBlockRegex);
-    if (match && !schemaContent.includes("isPro")) {
-      const newFields = `
+  if (schemaContent.includes("model User") && !schemaContent.includes("isPro")) {
+    const lines = schemaContent.split("\n");
+    let inUser = false;
+    let braceDepth = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i] as string;
+      if (!inUser && line.match(/^model\s+User\s*\{/)) {
+        inUser = true;
+      }
+      if (inUser) {
+        braceDepth += (line.match(/\{/g) || []).length;
+        braceDepth -= (line.match(/\}/g) || []).length;
+
+        if (braceDepth === 0) {
+          const newFields = `
   isPro               Boolean   @default(false)
   gatewayCustomerId   String?
   subscriptions       Subscription[]`;
-      schemaContent = schemaContent.replace(userBlockRegex, `$1${newFields}$2`);
+          lines.splice(i, 0, newFields);
+          break;
+        }
+      }
     }
+    schemaContent = lines.join("\n");
   }
 
   if (!schemaContent.includes("model Plan")) {
@@ -61,11 +77,13 @@ model Subscription {
 `;
   }
 
+
+
   fs.writeFileSync(schemaPath, schemaContent, "utf-8");
   report.mutatedFiles.push(schemaPath);
 
   try {
-    execSync("npx prisma generate", { stdio: "inherit", cwd: path.resolve(targetSrcDirectory, "..") });
+    execSync("npx prisma generate", { stdio: "inherit", timeout: 30000, cwd: path.resolve(targetSrcDirectory, "..") });
     return "[SUCCESS] Prisma schema updated and client generated.";
   } catch (err: unknown) {
     return `[WARNING] Prisma schema updated but 'npx prisma generate' failed: ${err}`;
@@ -229,11 +247,17 @@ export const injectSubscriptionSystem: Tool<FastMCPSessionAuth, InjectSubscripti
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_subscription_system", dryRun ? null : projectRoot, async (report) => {
+      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
       if (dryRun) {
         report.humanMessage = `[INFO] DRY RUN: Will mutate schema.prisma and generate Strategy Providers in src/services/subscription/`;
         return;
       }
 
+      // Snapshot schema path before mutation
+      const schemaPath = path.resolve(targetSrcDirectory, "../prisma/schema.prisma");
+      if (fs.existsSync(schemaPath)) {
+        report.snapshotFiles([schemaPath]);
+      }
       const dbResult = updatePrismaSchema(targetSrcDirectory, report);
 
       const subscriptionDir = path.resolve(targetSrcDirectory, "services", "subscription");
@@ -242,6 +266,13 @@ export const injectSubscriptionSystem: Tool<FastMCPSessionAuth, InjectSubscripti
       }
 
       const files = buildStrategyInterfaces();
+      // Snapshot existing files before overwriting
+      const filePathsToWrite: string[] = [];
+      for (const [name] of files.entries()) {
+        filePathsToWrite.push(path.join(subscriptionDir, name));
+      }
+      report.snapshotFiles(filePathsToWrite);
+
       let fileResult = "";
       for (const [name, content] of files.entries()) {
         const filePath = path.join(subscriptionDir, name);

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const injectSeederSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -80,7 +81,8 @@ export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_plan_seeder", dryRun ? null : projectRoot, async (report) => {
-      const scriptsDir = path.resolve(targetSrcDirectory, "scripts");
+      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const scriptsDir = path.resolve(safeSrcDir, "scripts");
       if (!fs.existsSync(scriptsDir)) {
         fs.mkdirSync(scriptsDir, { recursive: true });
       }
@@ -94,16 +96,19 @@ export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
       }
 
       if (!fs.existsSync(scriptPath)) {
+        report.snapshotFiles([scriptPath]);
+
         fs.writeFileSync(scriptPath, content, "utf-8");
         report.mutatedFiles.push(scriptPath);
       }
 
-      const pkgPath = path.resolve(targetSrcDirectory, "..", "package.json");
+      const pkgPath = path.resolve(safeSrcDir, "..", "package.json");
       if (fs.existsSync(pkgPath)) {
         try {
           const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
           pkg.scripts = pkg.scripts || {};
           pkg.scripts["seed:plans"] = "ts-node src/scripts/seedPlans.ts";
+          report.snapshotFiles([pkgPath]);
           fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2), "utf-8");
           report.mutatedFiles.push(pkgPath);
         } catch (err: unknown) {

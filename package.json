@@ -1,16 +1,37 @@
 {
   "name": "blueprint-mcp",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "start": "tsx src/index.ts",
-    "inspector": "npx @modelcontextprotocol/inspector tsx src/index.ts"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "version": "4.0.0",
+  "description": "Blueprint Architect MCP — AI-powered backend scaffolding server for Node.js/TypeScript projects. Automates Prisma setup, Express routing, auth, payments, and more via Model Context Protocol.",
+  "author": "Kunal Brahma",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "backend",
+    "scaffolding",
+    "prisma",
+    "express",
+    "typescript",
+    "ai",
+    "llm"
+  ],
   "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "blueprint-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/add-shebang.mjs",
+    "prepare": "npm run build",
+    "start": "tsx src/index.ts",
+    "inspector": "npx @modelcontextprotocol/inspector tsx src/index.ts",
+    "inspector:dist": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "test:safety": "node --import tsx --test tests/safety.test.ts"
+  },
   "dependencies": {
     "fastmcp": "^3.33.0",
     "ts-morph": "^27.0.2",
@@ -21,5 +42,8 @@
     "@types/node": "^25.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

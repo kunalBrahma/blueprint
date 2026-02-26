@@ -5,6 +5,7 @@ import * as path from "node:path";
 import util from "node:util";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
+import { enforcePathJail } from "../utils/pathJail.js";
 
 const execAsync = util.promisify(exec);
 
@@ -29,12 +30,13 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
     parameters: scaffoldProjectSchema,
     execute: async (args) => {
         const { projectName, outputDir, installDeps } = args;
-        const projectPath = path.join(outputDir, projectName);
+        const safeOutputDir = enforcePathJail(process.cwd(), path.resolve(outputDir));
+        const projectPath = path.join(safeOutputDir, projectName);
 
         return withMutationReport("scaffold_project", projectPath, async (report) => {
             // Validate output dir exists
-            if (!fs.existsSync(outputDir)) {
-                throw new Error(`Output directory does not exist: ${outputDir}`);
+            if (!fs.existsSync(safeOutputDir)) {
+                throw new Error(`Output directory does not exist: ${safeOutputDir}`);
             }
 
             // Check if project already exists
@@ -48,7 +50,8 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
 
             // Step 2: Clone the boilerplate DIRECTLY into the new folder using "."
             await execAsync(`git clone https://github.com/kunalBrahma/backend-boilerplate.git .`, {
-                cwd: projectPath
+                cwd: projectPath,
+                timeout: 30000,
             });
 
             // Step 3: Remove the original .git history
@@ -62,7 +65,7 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
             if (installDeps) {
                 try {
                     // Using cwd is cleaner and safer than chaining 'cd' commands
-                    await execAsync(`npm install`, { cwd: projectPath });
+                    await execAsync(`npm install`, { cwd: projectPath, timeout: 30000 });
                     installOutput = `\n[SUCCESS] NPM dependencies installed successfully.`;
                 } catch (err: unknown) {
                     const errorMessage = err instanceof Error ? err.message : String(err);
