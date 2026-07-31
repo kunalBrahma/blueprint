@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -41,6 +42,13 @@ const fieldSchema = z.object({
         .optional()
         .describe(
             "If set, the name of the referenced model. Adds @relation(fields: [<name>], references: [id])."
+        ),
+    defaultValue: z
+        .string()
+        .optional()
+        .describe(
+            "Optional raw @default(...) value, e.g. \"cuid()\" or \"detected\". " +
+            "For @id fields this overrides the auto-chosen default."
         ),
 });
 
@@ -104,12 +112,18 @@ function formatFields(fields: FieldDef[]): string[] {
 
         const attributes: string[] = [];
         if (f.isId) {
-            attributes.push("@id", idDefault(f.type));
+            attributes.push("@id");
+            // Custom defaultValue takes priority over the auto-chosen @default
+            attributes.push(f.defaultValue ? `@default(${f.defaultValue})` : idDefault(f.type));
+        } else if (f.defaultValue) {
+            // Non-id fields can also carry a custom @default
+            attributes.push(`@default(${f.defaultValue})`);
         }
         if (f.isUnique && !f.isId) {
             attributes.push("@unique");
         }
         if (f.relation) {
+            // Only emit @relation when the caller EXPLICITLY provided one.
             const fkField = `${f.name}Id`;
             attributes.push(`@relation(fields: [${fkField}], references: [id])`);
         }
@@ -171,7 +185,7 @@ export const injectPrismaModel: Tool<
 
         return withMutationReport("inject_prisma_model", dryRun ? null : projectRoot, async (report) => {
             // ── Path Jail: validate path ─────────────────────────────────────────
-            const safePath = enforcePathJail(projectRoot, resolvedPath);
+            const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
 
             // ── Validate schemaPath ────────────────────────────────────────────────
             if (!fs.existsSync(safePath)) {
@@ -209,13 +223,9 @@ export const injectPrismaModel: Tool<
                 name = name.replace(/IdId$/i, "Id");
                 name = name.charAt(0).toLowerCase() + name.slice(1);
 
-                let relation = f.relation;
-                if (!relation && /Id$/i.test(name)) {
-                    const base = name.slice(0, -2);
-                    relation = base.charAt(0).toUpperCase() + base.slice(1);
-                }
-
-                return { ...f, name, relation } as FieldDef;
+                // IMPORTANT: Only honour relations that the caller EXPLICITLY supplied.
+                // Never auto-infer a @relation from a field name ending in 'Id'.
+                return { ...f, name } as FieldDef;
             });
 
             // ── Build model block ──────────────────────────────────────────────────
@@ -310,7 +320,7 @@ export const injectPrismaModel: Tool<
 
             let prismaWarning = "";
             try {
-                execSync("npx prisma generate", { stdio: "inherit", cwd: projectRoot, timeout: 30000 });
+                execSync("npx prisma generate", { stdio: "pipe", cwd: projectRoot, timeout: 30000 });
             } catch (err) {
                 // Atomic rollback
                 try {

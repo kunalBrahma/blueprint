@@ -6,6 +6,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectRedisSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -27,7 +28,7 @@ const redisClient = new Redis(env.REDIS_URL, {
   enableReadyCheck: false,
 });
 
-redisClient.on("error", (err) => {
+redisClient.on("error", (err: Error) => {
   console.error("Redis error:", err);
 });
 
@@ -53,7 +54,7 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_redis_service", dryRun ? null : projectRoot, async (report) => {
-      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
       const servicesDir = path.resolve(safeSrcDir, "services");
       if (!fs.existsSync(servicesDir)) {
         fs.mkdirSync(servicesDir, { recursive: true });
@@ -82,10 +83,26 @@ export const injectRedisService: Tool<FastMCPSessionAuth, InjectRedisParams> = {
       try {
         const cwd = projectRoot;
         if (fs.existsSync(path.join(cwd, "package.json"))) {
-          execSync("npm install ioredis express-rate-limit rate-limit-redis --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
+          const pkgJsonPath = path.join(cwd, "package.json");
+          const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
+          const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
+
+          const pkgs = ["ioredis", "express-rate-limit", "rate-limit-redis"];
+          // @types/node is required by ioredis in strict TypeScript projects
+          const devPkgs = ["@types/node"];
+
+          const need = pkgs.filter(p => !allDeps[p]);
+          const needDev = devPkgs.filter(p => !allDeps[p]);
+
+          if (need.length > 0) {
+            execSync(`npm install ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
+          }
+          if (needDev.length > 0) {
+            execSync(`npm install -D ${needDev.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
+          }
         }
       } catch (err: unknown) {
-        packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install ioredis express-rate-limit rate-limit-redis";
+        packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install ioredis express-rate-limit rate-limit-redis\n  npm install -D @types/node";
         report.status = "PARTIAL_FAILURE";
       }
 

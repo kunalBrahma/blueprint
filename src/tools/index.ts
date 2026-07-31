@@ -19,6 +19,7 @@ import { injectApiTests } from "./injectApiTests.js";
 import { injectSubscriptionSystem } from "./injectSubscriptionSystem.js";
 import { injectPlanSeeder } from "./injectPlanSeeder.js";
 
+
 // ─── Tier Classification ───────────────────────────────────────────────────────
 //
 // FREE TOOLS:  Basic scaffolding, simple CRUD, standard Prisma schema creation.
@@ -36,6 +37,7 @@ export const FREE_TOOL_NAMES = new Set<string>([
     "inject_crud_controller",// Generate basic CRUD controller for a Prisma model
     "inject_env_validation", // Zod-powered environment variable validator
     "inject_express_route",  // Surgically inject a route into an Express router
+
 ]);
 
 export const PRO_TOOL_NAMES = new Set<string>([
@@ -65,6 +67,7 @@ export const allTools = [
     injectPrismaModel,
     injectCrudController,
     injectEnvValidation,
+
     // Pro tier
     injectAuthSystem,
     injectStorageService,

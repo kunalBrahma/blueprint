@@ -20,48 +20,46 @@ export function enforcePathJail(
         );
     }
 
-    // Resolve the requested path against the workspace root
-    const resolved = path.resolve(workspaceRoot, requestedPath);
-    const normalizedRoot = path.normalize(workspaceRoot);
+    const resolvedTarget = path.resolve(workspaceRoot, requestedPath);
+    const resolvedRoot = path.resolve(workspaceRoot);
 
-    // Boundary check: resolved path must start with the workspace root
-    if (resolved !== normalizedRoot && !resolved.startsWith(normalizedRoot + path.sep)) {
+    if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
         throw new Error(
             `[PathJail] Path traversal blocked.\n` +
-            `  Workspace: ${normalizedRoot}\n` +
+            `  Workspace: ${resolvedRoot}\n` +
             `  Requested: ${requestedPath}\n` +
-            `  Resolved:  ${resolved}\n` +
+            `  Resolved:  ${resolvedTarget}\n` +
             `The resolved path escapes the workspace boundary.`
         );
     }
 
     // Symlink check: if the path exists on disk, verify its real path
     // is also within the workspace boundary
-    if (fs.existsSync(resolved)) {
-        const realPath = fs.realpathSync(resolved);
-        const realRoot = fs.realpathSync(normalizedRoot);
+    if (fs.existsSync(resolvedTarget)) {
+        const realPath = fs.realpathSync(resolvedTarget);
+        const realRoot = fs.realpathSync(resolvedRoot);
 
         if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
             throw new Error(
                 `[PathJail] Symlink escape blocked.\n` +
                 `  Workspace: ${realRoot}\n` +
-                `  Symlink:   ${resolved}\n` +
+                `  Symlink:   ${resolvedTarget}\n` +
                 `  Real path: ${realPath}\n` +
                 `The symlink target escapes the workspace boundary.`
             );
         }
     } else {
         // For non-existent paths, validate the nearest existing ancestor
-        let ancestor = path.dirname(resolved);
+        let ancestor = path.dirname(resolvedTarget);
         for (let depth = 0; depth < 20; depth++) {
             if (fs.existsSync(ancestor)) {
                 const realAncestor = fs.realpathSync(ancestor);
-                const realRoot = fs.realpathSync(normalizedRoot);
+                const realRoot = fs.realpathSync(resolvedRoot);
                 if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) {
                     throw new Error(
                         `[PathJail] Ancestor symlink escape blocked.\n` +
                         `  Workspace:       ${realRoot}\n` +
-                        `  Resolved path:   ${resolved}\n` +
+                        `  Resolved path:   ${resolvedTarget}\n` +
                         `  Ancestor:        ${ancestor}\n` +
                         `  Real ancestor:   ${realAncestor}\n` +
                         `The nearest existing ancestor resolves outside the workspace.`
@@ -75,5 +73,5 @@ export function enforcePathJail(
         }
     }
 
-    return resolved;
+    return resolvedTarget;
 }

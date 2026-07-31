@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectApiTestsSchema = z.object({
   targetRootDirectory: z.string().describe("Absolute path to the root directory (where package.json and src/ live)"),
@@ -28,12 +29,50 @@ export default defineConfig({
 `.trimStart();
 }
 
-function buildAuthTest(): string {
+function buildAuthTest(appFileName: string): string {
+  const appName = appFileName.replace(/\.(ts|js)$/, "");
   return `
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import request from "supertest";
-import app from "../app"; 
+import app from "../${appName}"; 
 
+describe("Auth Endpoints", () => {
+`.trimStart();
+}
+
+export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
+  name: "inject_api_tests",
+  description: "Scaffolds automated integration tests utilizing vitest and supertest.",
+  parameters: injectApiTestsSchema,
+
+  execute: async (args) => {
+    const { targetRootDirectory, dryRun } = args;
+    const rootDir = path.resolve(targetRootDirectory);
+
+    return withMutationReport("inject_api_tests", dryRun ? null : rootDir, async (report) => {
+      const safeRootDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetRootDirectory));
+      if (!fs.existsSync(safeRootDir)) {
+        throw new Error(`Root directory not found: "${safeRootDir}"`);
+      }
+
+      const srcDir = path.join(safeRootDir, "src");
+      const appFile = fs.readdirSync(srcDir).find(f => f.startsWith("app.") || f.startsWith("server."));
+      const appFileName = appFile || "app";
+
+      const testsDir = path.join(srcDir, "__tests__");
+      if (!fs.existsSync(testsDir)) {
+        fs.mkdirSync(testsDir, { recursive: true });
+      }
+
+      const vitestConfigPath = path.join(safeRootDir, "vitest.config.ts");
+      const authTestPath = path.join(testsDir, "auth.test.ts");
+
+      if (fs.existsSync(authTestPath)) {
+        throw new Error(`File already exists: "${authTestPath}".`);
+      }
+
+      const vitestContent = buildVitestConfig();
+      const testContent = buildAuthTest(appFileName) + `
 describe("Auth Endpoints", () => {
   it("POST /api/auth/login - should return 400 for validation error", async () => {
     const res = await request(app)
@@ -54,37 +93,6 @@ describe("Auth Endpoints", () => {
   });
 });
 `.trimStart();
-}
-
-export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
-  name: "inject_api_tests",
-  description: "Scaffolds automated integration tests utilizing vitest and supertest.",
-  parameters: injectApiTestsSchema,
-
-  execute: async (args) => {
-    const { targetRootDirectory, dryRun } = args;
-    const rootDir = path.resolve(targetRootDirectory);
-
-    return withMutationReport("inject_api_tests", dryRun ? null : rootDir, async (report) => {
-      const safeRootDir = enforcePathJail(rootDir, path.resolve(targetRootDirectory));
-      if (!fs.existsSync(safeRootDir)) {
-        throw new Error(`Root directory not found: "${safeRootDir}"`);
-      }
-
-      const testsDir = path.join(safeRootDir, "src", "__tests__");
-      if (!fs.existsSync(testsDir)) {
-        fs.mkdirSync(testsDir, { recursive: true });
-      }
-
-      const vitestConfigPath = path.join(safeRootDir, "vitest.config.ts");
-      const authTestPath = path.join(testsDir, "auth.test.ts");
-
-      if (fs.existsSync(authTestPath)) {
-        throw new Error(`File already exists: "${authTestPath}".`);
-      }
-
-      const vitestContent = buildVitestConfig();
-      const testContent = buildAuthTest();
 
       if (dryRun) {
         const sep = "─".repeat(60);
@@ -92,9 +100,9 @@ export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
         return;
       }
 
-      if (!fs.existsSync(vitestConfigPath)) {
-        report.snapshotFiles([vitestConfigPath, authTestPath]);
+      report.snapshotFiles([vitestConfigPath, authTestPath]);
 
+      if (!fs.existsSync(vitestConfigPath)) {
         fs.writeFileSync(vitestConfigPath, vitestContent, "utf-8");
         report.mutatedFiles.push(vitestConfigPath);
       }
@@ -111,7 +119,7 @@ export const injectApiTests: Tool<FastMCPSessionAuth, InjectApiTestsParams> = {
           const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
           const need = pkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install -D ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install -D ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
 
           pkgJson.scripts = pkgJson.scripts || {};

@@ -6,6 +6,7 @@ import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectRateLimiterSchema = z.object({
     targetFile: z.string().describe("Absolute path to the Express router file (e.g. auth.routes.ts)"),
@@ -26,13 +27,19 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_rate_limiter", dryRun ? null : projectRoot, async (report) => {
-            const safePath = enforcePathJail(projectRoot, resolvedPath);
+            const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
             if (!fs.existsSync(resolvedPath)) {
                 throw new Error(`File not found: "${resolvedPath}"`);
             }
 
             const project = new Project({ useInMemoryFileSystem: true });
             const sourceFile = project.createSourceFile(resolvedPath, fs.readFileSync(resolvedPath, "utf-8"), { overwrite: true });
+
+            const safeSrcDir = path.dirname(path.dirname(safePath));
+            const redisServicePath = path.resolve(safeSrcDir, "services/redis.service.ts");
+            if (!fs.existsSync(redisServicePath)) {
+                throw new Error("Redis service not found. Please run inject_redis_service first.");
+            }
 
             const hasRateLimit = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "express-rate-limit");
             if (!hasRateLimit) {
@@ -93,10 +100,10 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
                     const need = pkgs.filter(p => !allDeps[p]);
                     const needDev = devPkgs.filter(p => !allDeps[p]);
                     if (need.length > 0) {
-                        execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+                        execSync(`npm install ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
                     }
                     if (needDev.length > 0) {
-                        execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+                        execSync(`npm install -D ${needDev.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
                     }
                 }
             } catch (err: unknown) {

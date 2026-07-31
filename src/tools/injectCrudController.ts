@@ -5,6 +5,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectCrudSchema = z.object({
   modelName: z.string().regex(/^[A-Z][a-zA-Z0-9]*$/, "modelName must be PascalCase"),
@@ -24,11 +25,17 @@ function toPlural(word: string): string {
   return word + "s";
 }
 
-function getModelFields(targetDir: string, modelName: string) {
+interface ModelField {
+  name: string;
+  type: string;
+  isOptional: boolean;
+}
+
+function getModelFields(targetDir: string, modelName: string): { hasCreatedAt: boolean, hasUpdatedAt: boolean, fields: ModelField[] } {
   const schemaPath = path.resolve(targetDir, "../../prisma/schema.prisma");
   let hasCreatedAt = false;
   let hasUpdatedAt = false;
-  const fields: { name: string, type: string, isOptional: boolean }[] = [];
+  const fields: ModelField[] = [];
 
   if (fs.existsSync(schemaPath)) {
     const content = fs.readFileSync(schemaPath, "utf-8");
@@ -36,26 +43,64 @@ function getModelFields(targetDir: string, modelName: string) {
     const match = content.match(modelRegex);
     if (match && match[1]) {
       const block = match[1];
-      const lines = block.split("\\n");
+      const lines = block.split("\n");
+      const scalarTypes = ["String", "Int", "Float", "Boolean", "DateTime", "Json", "Decimal", "BigInt", "Bytes"];
+
       for (const line of lines) {
-        const parts = line.trim().split(/\\s+/);
+        const parts = line.trim().split(/\s+/);
         if (parts.length >= 2 && !line.includes("@@") && !line.includes("//")) {
           const name = parts[0];
-          let type = parts[1];
-          if (!name) continue;
-          if (name === "createdAt") hasCreatedAt = true;
-          if (name === "updatedAt") hasUpdatedAt = true;
+          let type = parts[1] as string;
+          if (!name || name === "") continue;
+          if (name === "createdAt") { hasCreatedAt = true; continue; }
+          if (name === "updatedAt") { hasUpdatedAt = true; continue; }
+          if (name === "id") continue;
+
+          const isOptional = type.endsWith("?") || line.includes("@default");
+          const cleanType = type.replace("?", "").replace("[]", "");
+
+          const isRelation = !scalarTypes.includes(cleanType);
+          if (isRelation) continue;
 
           fields.push({
             name,
-            type: type?.replace("?", "") ?? "String",
-            isOptional: type?.endsWith("?") ?? false
+            type: cleanType,
+            isOptional
           });
         }
       }
     }
   }
   return { hasCreatedAt, hasUpdatedAt, fields };
+}
+
+function generateZodSchema(fields: ModelField[], modelName: string) {
+  let createSchema = `export const Create${modelName}Schema = z.object({\n`;
+  let updateSchema = `export const Update${modelName}Schema = z.object({\n`;
+
+  fields.forEach(f => {
+    let zodType = "z.string()";
+    if (f.type === "Int" || f.type === "Float") zodType = "z.number()";
+    else if (f.type === "Decimal") zodType = "z.coerce.number()";
+    else if (f.type === "Boolean") zodType = "z.boolean()";
+    else if (f.type === "DateTime") zodType = "z.coerce.date()";
+    else if (f.type === "Json") zodType = "z.union([z.string(), z.number(), z.boolean(), z.null(), z.array(z.any()), z.record(z.any())])";
+    else if (f.type === "BigInt") zodType = "z.coerce.bigint()";
+    else if (f.type === "Bytes") zodType = "z.union([z.instanceof(Buffer), z.instanceof(Uint8Array)])";
+
+    updateSchema += `  ${f.name}: ${zodType}.optional(),\n`;
+
+    if (f.isOptional) {
+      createSchema += `  ${f.name}: ${zodType}.optional(),\n`;
+    } else {
+      createSchema += `  ${f.name}: ${zodType},\n`;
+    }
+  });
+
+  createSchema += `});\n`;
+  updateSchema += `});\n`;
+
+  return { createSchema, updateSchema };
 }
 
 function buildCrudController(modelName: string, hasStorage: boolean, targetDir: string): string {
@@ -72,16 +117,38 @@ function buildCrudController(modelName: string, hasStorage: boolean, targetDir: 
     moduleSpecifier: "express",
   });
   sourceFile.addImportDeclaration({
+    namedImports: ["Prisma"],
+    moduleSpecifier: "@prisma/client",
+    isTypeOnly: true,
+  });
+  sourceFile.addImportDeclaration({
     defaultImport: "prisma",
     moduleSpecifier: "../config/prisma",
   });
+  sourceFile.addImportDeclaration({
+    namedImports: ["z"],
+    moduleSpecifier: "zod",
+  });
 
-  if (hasStorage) {
+  const hasImageField = fields.some(f => f.name === "imageUrl");
+  const useStorage = hasStorage && hasImageField;
+
+  if (useStorage) {
     sourceFile.addImportDeclaration({
       namedImports: ["storageService"],
       moduleSpecifier: "../services/storage.service",
     });
   }
+
+  const { createSchema, updateSchema } = generateZodSchema(fields, modelName);
+  sourceFile.addStatements(`\n${createSchema}\n${updateSchema}\n`);
+
+  sourceFile.addStatements(`
+function buildOrderBy(field: string, order: string): Record<string, "asc" | "desc"> {
+  const direction = order === "desc" ? "desc" : "asc";
+  return { [field]: direction };
+}
+`);
 
   const addFn = (name: string, body: string) => {
     sourceFile.addStatements("\n");
@@ -100,16 +167,10 @@ function buildCrudController(modelName: string, hasStorage: boolean, targetDir: 
 
   // ── 1. create<Model> ───────────────────────────────────────────────────────
   let createBody = `
-    const data: any = { ...req.body };
+    const parsed = Create${modelName}Schema.parse(req.body);
+    const data = parsed;
 `;
-  fields.forEach(f => {
-    if (!f.isOptional && f.name !== "id" && f.name !== "createdAt" && f.name !== "updatedAt" && f.type === "String") {
-      if (f.name !== "imageUrl" && f.name !== "thumbnailPath" && !f.name.endsWith("Id")) {
-        createBody += `    data.${f.name} = data.${f.name} || "Default";\n`;
-      }
-    }
-  });
-  if (hasStorage) {
+  if (useStorage) {
     createBody += `
     if (req.file) {
       data.imageUrl = await storageService.uploadFile(req.file);
@@ -117,22 +178,50 @@ function buildCrudController(modelName: string, hasStorage: boolean, targetDir: 
 `;
   }
   createBody += `
-    const ${model} = await prisma.${model}.create({ data });
+    const ${model} = await prisma.${model}.create({ data: parsed });
     res.status(201).json({ success: true, data: ${model} });
 `;
   addFn(`create${modelName}`, `
   try {
 ${createBody}
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    res.status(400).json({ success: false, message });
+    if (error instanceof z.ZodError) {
+      const formatted = error.flatten();
+      res.status(400).json({ success: false, errors: formatted.fieldErrors });
+      return;
+    }
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 `);
 
   // ── 2. getAll<Model>s (Advanced Query) ──────────────────────────────────────────────────────
+  const stringFields = fields.filter(f => f.type === "String" && f.name !== "id" && !f.name.endsWith("Id"));
   const defaultSort = hasCreatedAt ? "createdAt" : "id";
-  const selectLines = fields.map(f => `        ${f.name}: true,`).join("\\n");
-  const selectBlock = fields.length > 0 ? `\n        select: {\n${selectLines}\n        },` : "";
+
+  let searchClause = "";
+  if (stringFields.length > 0) {
+    const orConditions = stringFields.map(f => `{ ${f.name}: { contains: search as string, mode: "insensitive" } }`).join(",\n        ");
+    searchClause = `
+    if (search) {
+      where.OR = [
+        ${orConditions}
+      ];
+    }`;
+  }
+
+  const validSortFields = ["id", ...fields.map(f => f.name)];
+  if (hasCreatedAt) validSortFields.push("createdAt");
+  if (hasUpdatedAt) validSortFields.push("updatedAt");
+  const validSortArray = JSON.stringify(validSortFields);
+
+  const filterableFields = fields
+    .map(f => f.name)
+    .filter(name => name !== "id" && name !== "createdAt" && name !== "updatedAt" && !name.endsWith("Id"));
+  const filterableArray = JSON.stringify(filterableFields);
 
   addFn(`getAll${pluralPascal}`, `
   try {
@@ -141,20 +230,32 @@ ${createBody}
     const limitNumber = parseInt(limit as string, 10);
     const skip = (pageNumber - 1) * limitNumber;
 
-    const where: any = { ...filters };
-    if (search) {
-      where.OR = [
-        { name: { contains: search as string, mode: "insensitive" } },
-        { description: { contains: search as string, mode: "insensitive" } }
-      ];
+    const validSortFields = ${validSortArray};
+    const filterableFields = ${filterableArray};
+    if (!validSortFields.includes(sortBy as string)) {
+      res.status(400).json({ success: false, message: \`Invalid sortBy field. Allowed fields: \${validSortFields.join(", ")}\` });
+      return;
     }
+
+    const where: Prisma.${modelName}WhereInput = {};
+    for (const key in filters) {
+      if (filterableFields.includes(key)) {
+        let value: any = filters[key];
+        
+        if (value === "true") value = true;
+        if (value === "false") value = false;
+
+        (where as Record<string, unknown>)[key] = value;
+      }
+    }
+${searchClause}
 
     const [${plural}, total] = await Promise.all([
       prisma.${model}.findMany({
         where,
         skip,
         take: limitNumber,
-        orderBy: { [sortBy as string]: sortOrder as string },${selectBlock}
+        orderBy: buildOrderBy(sortBy as string, sortOrder as string),
       }),
       prisma.${model}.count({ where })
     ]);
@@ -168,8 +269,11 @@ ${createBody}
       data: ${plural} 
     });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    res.status(500).json({ success: false, message });
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 `);
 
@@ -184,22 +288,26 @@ ${createBody}
     }
     res.status(200).json({ success: true, data: ${model} });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    res.status(500).json({ success: false, message });
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 `);
 
   // ── 4. update<Model> ──────────────────────────────────────────────────────
   let updateBody = `
     const { id } = req.params;
-    const data = { ...req.body };
+    const parsed = Update${modelName}Schema.parse(req.body);
+
     const existing = await prisma.${model}.findUnique({ where: { id } });
     if (!existing) {
       res.status(404).json({ success: false, message: "${modelName} not found" });
       return;
     }
 `;
-  if (hasStorage) {
+  if (useStorage) {
     updateBody += `
     if (req.file) {
       data.imageUrl = await storageService.uploadFile(req.file);
@@ -207,7 +315,7 @@ ${createBody}
 `;
   }
   updateBody += `
-    const updated = await prisma.${model}.update({ where: { id }, data });
+    const updated = await prisma.${model}.update({ where: { id }, data: parsed });
     res.status(200).json({ success: true, data: updated });
 `;
 
@@ -215,8 +323,16 @@ ${createBody}
   try {
 ${updateBody}
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    res.status(400).json({ success: false, message });
+    if (error instanceof z.ZodError) {
+      const formatted = error.flatten();
+      res.status(400).json({ success: false, errors: formatted.fieldErrors });
+      return;
+    }
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 `);
 
@@ -232,14 +348,34 @@ ${updateBody}
     await prisma.${model}.delete({ where: { id } });
     res.status(200).json({ success: true, message: "${modelName} deleted successfully" });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Internal server error";
-    res.status(500).json({ success: false, message });
+    if (error instanceof Error) {
+      res.status(500).json({ success: false, message: error.message });
+      return;
+    }
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 `);
 
   sourceFile.fixUnusedIdentifiers();
   sourceFile.organizeImports();
-  return sourceFile.getFullText();
+  
+  const generated = sourceFile.getFullText();
+  const anyMatches = generated.match(/\bas\s+any\b/g);
+  if (anyMatches && anyMatches.length > 0) {
+    throw new Error(
+      `[Quality Gate] Generated file contains ` +
+      `${anyMatches.length} "as any" cast(s). ` +
+      `This is a generator bug — fix the template before ` +
+      `writing to disk.\n\n` +
+      `Offending content preview:\n` +
+      generated
+        .split("\n")
+        .filter(l => /\bas\s+any\b/.test(l))
+        .map(l => `  ${l.trim()}`)
+        .join("\n")
+    );
+  }
+  return generated;
 }
 
 export const injectCrudController: Tool<FastMCPSessionAuth, InjectCrudParams> = {
@@ -255,7 +391,8 @@ export const injectCrudController: Tool<FastMCPSessionAuth, InjectCrudParams> = 
     const projectRoot = path.resolve(resolvedDir, "../..");
 
     return withMutationReport("inject_crud_controller", dryRun ? null : projectRoot, async (report) => {
-      const safeDir = enforcePathJail(projectRoot, resolvedDir);
+      report.skipValidation = true;
+      const safeDir = enforcePathJail(WORKSPACE_ROOT, resolvedDir);
       if (!fs.existsSync(safeDir)) throw new Error(`Directory not found: "${safeDir}"`);
 
       const fileName = `${toCamel(modelName)}.controller.ts`;
@@ -277,11 +414,10 @@ export const injectCrudController: Tool<FastMCPSessionAuth, InjectCrudParams> = 
 
       report.snapshotFiles([outputPath]);
 
-
       fs.writeFileSync(outputPath, content, "utf-8");
       report.mutatedFiles.push(outputPath);
 
-      const msg = hasStorage ? "\\n[INFO] Storage middleware detected! Added req.file logic." : "";
+      const msg = hasStorage ? "\n[INFO] Storage middleware detected! Added req.file logic." : "";
       report.humanMessage = `[SUCCESS] CRUD controller generated successfully!\nFile: ${outputPath}${msg}`;
     });
   },

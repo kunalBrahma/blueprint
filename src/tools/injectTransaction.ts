@@ -5,6 +5,7 @@ import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -67,12 +68,13 @@ ${indentedCallback ? indentedCallback + "\n" : ""}
 
 // ─── 3. AST Helpers ───────────────────────────────────────────────────────────
 
+// FIX: Added fullLogic parameter to check both the transaction body AND the callback
 function ensureDynamicImports(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>,
-    transactionLogic: string,
+    fullLogic: string,
     warnings: string[]
 ) {
-    if (transactionLogic.includes("Stripe") || transactionLogic.includes("stripe")) {
+    if (fullLogic.includes("Stripe") || fullLogic.includes("stripe")) {
         const existing = sourceFile.getImportDeclarations().find(imp => {
             const def = imp.getDefaultImport();
             const named = imp.getNamedImports().some(n => n.getName() === "Stripe");
@@ -87,7 +89,7 @@ function ensureDynamicImports(
         }
     }
 
-    if (transactionLogic.includes("paymentService")) {
+    if (fullLogic.includes("paymentService")) {
         const paymentImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../services/payment.service");
         if (paymentImport) {
             const hasNamed = paymentImport.getNamedImports().some((n) => n.getName() === "paymentService");
@@ -102,22 +104,38 @@ function ensureDynamicImports(
         }
     }
 
-    if (transactionLogic.includes("mailService")) {
-        const mailImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../utils/mail");
+    // FIX: Auto-import socketService if used in the transaction or callback
+    if (fullLogic.includes("socketService")) {
+        const socketImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../services/socket.service");
+        if (socketImport) {
+            const hasNamed = socketImport.getNamedImports().some((n) => n.getName() === "socketService");
+            if (!hasNamed) socketImport.addNamedImport("socketService");
+        } else {
+            const existing = sourceFile.getImportDeclarations().find(imp => imp.getNamedImports().some(n => n.getName() === "socketService") || (imp.getDefaultImport()?.getText() === "socketService"));
+            if (existing) {
+                warnings.push(`[WARNING] Symbol 'socketService' already imported from '${existing.getModuleSpecifierValue()}'. Skipping import from '../services/socket.service'.`);
+            } else {
+                sourceFile.addImportDeclaration({ namedImports: ["socketService"], moduleSpecifier: "../services/socket.service" });
+            }
+        }
+    }
+
+    if (fullLogic.includes("mailService")) {
+        const mailImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../services/mail.service");
         if (mailImport) {
             const hasNamed = mailImport.getNamedImports().some((n) => n.getName() === "mailService");
             if (!hasNamed) mailImport.addNamedImport("mailService");
         } else {
             const existing = sourceFile.getImportDeclarations().find(imp => imp.getNamedImports().some(n => n.getName() === "mailService") || imp.getDefaultImport()?.getText() === "mailService");
             if (existing) {
-                warnings.push(`[WARNING] Symbol 'mailService' already imported from '${existing.getModuleSpecifierValue()}'. Skipping import from '../utils/mail'.`);
+                warnings.push(`[WARNING] Symbol 'mailService' already imported from '${existing.getModuleSpecifierValue()}'. Skipping import from '../services/mail.service'.`);
             } else {
-                sourceFile.addImportDeclaration({ namedImports: ["mailService"], moduleSpecifier: "../utils/mail" });
+                sourceFile.addImportDeclaration({ namedImports: ["mailService"], moduleSpecifier: "../services/mail.service" });
             }
         }
     }
 
-    if (transactionLogic.includes("smsService")) {
+    if (fullLogic.includes("smsService")) {
         const smsImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "../utils/sms");
         if (smsImport) {
             const hasNamed = smsImport.getNamedImports().some((n) => n.getName() === "smsService");
@@ -132,7 +150,7 @@ function ensureDynamicImports(
         }
     }
 
-    if (transactionLogic.includes("AppError")) {
+    if (fullLogic.includes("AppError")) {
         const existing = sourceFile.getImportDeclarations().find(imp => {
             const def = imp.getDefaultImport();
             const named = imp.getNamedImports().some(n => n.getName() === "AppError");
@@ -223,7 +241,7 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
     name: "inject_transaction",
     description:
         "Universal AST Shell: Wraps AI-provided logic inside a production-grade prisma.$transaction block. " +
-        "Automatically detects and injects imports for Stripe, Razorpay, Mail, and SMS services based on the provided logic. " +
+        "Automatically detects and injects imports for Stripe, Razorpay, Mail, Socket, and SMS services based on the provided logic. " +
         "AI must use the 'tx' variable for transaction-safe operations.",
     parameters: injectTransactionSchema,
 
@@ -233,7 +251,7 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_transaction", dryRun ? null : projectRoot, async (report) => {
-            const safePath = enforcePathJail(projectRoot, resolvedPath);
+            const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
 
             // ── 1. Read or Create File ──────────────────────────────────────────────
             let fileContent = "";
@@ -271,7 +289,10 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
             // ── 4. Ensure Imports ──────────────────────────────────────────────────
             const warnings: string[] = [];
             ensureExpressAndPrismaImports(sourceFile, warnings);
-            ensureDynamicImports(sourceFile, transactionLogic + (callbackAction ? `\n${callbackAction}` : ""), warnings);
+
+            // FIX: Pass the combined logic and callback string so AST can find socketService
+            const fullLogicString = transactionLogic + (callbackAction ? `\n${callbackAction}` : "");
+            ensureDynamicImports(sourceFile, fullLogicString, warnings);
 
             // ── 5. Inject the Transaction Function ─────────────────────────────────
             const functionString = buildTransactionFunction(functionName, transactionLogic, callbackAction);
@@ -298,13 +319,14 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
 
             // Check for payment service helper
             let servicePath: string | undefined;
-            if (transactionLogic.includes("paymentService") || transactionLogic.includes("Razorpay") || transactionLogic.includes("razorpay")) {
-                const servicesDir = enforcePathJail(projectRoot, path.resolve(path.dirname(safePath), "../services"));
+            if (fullLogicString.includes("paymentService")) {
+                const servicesDir = path.resolve(path.dirname(safePath), "../services");
                 if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
                 servicePath = path.join(servicesDir, "payment.service.ts");
-                if (!fs.existsSync(servicePath)) {
-                    filesToSnapshot.push(servicePath);
-                }
+            }
+
+            if (servicePath && !fs.existsSync(servicePath)) {
+                filesToSnapshot.push(servicePath);
             }
 
             report.snapshotFiles(filesToSnapshot);

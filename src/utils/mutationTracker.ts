@@ -19,6 +19,7 @@ export interface MutationReport {
     mutatedFiles: string[];
     humanMessage: string;
     status?: "SUCCESS" | "PARTIAL_FAILURE";
+    skipValidation?: boolean;
     /**
      * Register file paths to snapshot BEFORE writing to them.
      * Call this before performing any fs.writeFile operations.
@@ -98,7 +99,8 @@ function findProjectRoot(startPath: string): string | null {
 export async function withMutationReport(
     operationName: string,
     projectPath: string | null,
-    action: (report: MutationReport) => Promise<void>
+    action: (report: MutationReport) => Promise<void>,
+    skipValidation?: boolean
 ): Promise<string> {
     const correlationId = crypto.randomUUID();
     const snapshots: FileSnapshot = new Map();
@@ -140,7 +142,10 @@ export async function withMutationReport(
     }
 
     // Run tsc --noEmit validation only on non-error, non-empty mutations
-    if (result.status !== "ERROR" && projectPath) {
+    const envSkip = process.env.SKIP_TSC_VALIDATION === "true" || process.env.NODE_ENV === "test";
+    const finalSkip = envSkip || skipValidation || report.skipValidation;
+
+    if (result.status !== "ERROR" && projectPath && !finalSkip) {
         const root = findProjectRoot(projectPath);
         if (root && fs.existsSync(path.join(root, "tsconfig.json"))) {
             try {

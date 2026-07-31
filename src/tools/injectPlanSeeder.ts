@@ -5,6 +5,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectSeederSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -81,7 +82,7 @@ export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_plan_seeder", dryRun ? null : projectRoot, async (report) => {
-      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
       const scriptsDir = path.resolve(safeSrcDir, "scripts");
       if (!fs.existsSync(scriptsDir)) {
         fs.mkdirSync(scriptsDir, { recursive: true });

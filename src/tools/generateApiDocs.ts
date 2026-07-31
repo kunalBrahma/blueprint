@@ -6,6 +6,7 @@ import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const generateDocsSchema = z.object({
   serverFile: z.string().describe("Absolute path to the main application file (server.ts / app.ts)"),
@@ -148,7 +149,7 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
     const { serverFile, targetSrcDirectory, dryRun } = args;
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
-    const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
+    const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
     const projectRoot = path.resolve(resolvedSrcDir, "..");
 
     return withMutationReport("generate_api_docs", dryRun ? null : projectRoot, async (report) => {
@@ -194,10 +195,10 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install -D ${needDev.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
         }
       } catch (err: unknown) {

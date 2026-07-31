@@ -5,6 +5,7 @@ import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectGlobalErrorSchema = z.object({
     serverFile: z.string().describe("Absolute path to the main application file (e.g. server.ts or app.ts)"),
@@ -125,14 +126,22 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
 
     const stmts = sourceFile.getStatements();
     let lastAppUseIndex = -1;
+    let listenIndex = -1;
 
     stmts.forEach((stmt, i) => {
         if (!Node.isExpressionStatement(stmt)) return;
         const expr = stmt.getExpression();
         if (!Node.isCallExpression(expr)) return;
         const callee = expr.getExpression();
-        if (Node.isPropertyAccessExpression(callee) && callee.getExpression().getText() === appVarName) {
+        if (Node.isPropertyAccessExpression(callee) && 
+            callee.getExpression().getText() === appVarName &&
+            callee.getName() === "use") {
             lastAppUseIndex = i;
+        }
+        if (Node.isPropertyAccessExpression(callee) && 
+            callee.getExpression().getText() === appVarName &&
+            callee.getName() === "listen") {
+            listenIndex = i;
         }
     });
 
@@ -140,7 +149,9 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     const alreadyMounted = stmts.some(stmt => stmt.getText().includes("globalErrorHandler"));
 
     if (!alreadyMounted) {
-        if (lastAppUseIndex !== -1) {
+        if (listenIndex !== -1) {
+            sourceFile.insertStatements(listenIndex, useStmt);
+        } else if (lastAppUseIndex !== -1) {
             sourceFile.insertStatements(lastAppUseIndex + 1, useStmt);
         } else {
             sourceFile.addStatements(useStmt);
@@ -161,7 +172,7 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
         const { serverFile, targetSrcDirectory, dryRun } = args;
         const resolvedServerPath = path.resolve(serverFile);
         const resolvedSrcDir = path.resolve(targetSrcDirectory);
-        const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
+        const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
         const projectRoot = path.resolve(resolvedSrcDir, "..");
 
         return withMutationReport("inject_global_error_handler", dryRun ? null : projectRoot, async (report) => {

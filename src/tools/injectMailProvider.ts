@@ -6,6 +6,7 @@ import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectMailSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src directory where services live"),
@@ -112,7 +113,7 @@ export const injectMailProvider: Tool<FastMCPSessionAuth, InjectMailParams> = {
         const projectRoot = path.resolve(targetSrcDirectory, "..");
 
         return withMutationReport("inject_mail_provider", dryRun ? null : projectRoot, async (report) => {
-            const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+            const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
             const servicesDir = path.resolve(safeSrcDir, "services");
             if (!fs.existsSync(servicesDir)) {
                 fs.mkdirSync(servicesDir, { recursive: true });
@@ -145,7 +146,7 @@ export const injectMailProvider: Tool<FastMCPSessionAuth, InjectMailParams> = {
             try {
                 const cwd = projectRoot;
                 if (fs.existsSync(path.join(cwd, "package.json"))) {
-                    execSync("npm install resend --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
+                    execSync("npm install resend --save-exact", { cwd, stdio: "pipe", timeout: 30000 });
                 }
             } catch (err: unknown) {
                 packageWarnings = "\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install resend";

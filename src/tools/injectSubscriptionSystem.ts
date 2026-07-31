@@ -6,6 +6,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectSubscriptionSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -83,7 +84,7 @@ model Subscription {
   report.mutatedFiles.push(schemaPath);
 
   try {
-    execSync("npx prisma generate", { stdio: "inherit", timeout: 30000, cwd: path.resolve(targetSrcDirectory, "..") });
+    execSync("npx prisma generate", { stdio: "pipe", timeout: 30000, cwd: path.resolve(targetSrcDirectory, "..") });
     return "[SUCCESS] Prisma schema updated and client generated.";
   } catch (err: unknown) {
     return `[WARNING] Prisma schema updated but 'npx prisma generate' failed: ${err}`;
@@ -111,8 +112,8 @@ export class StripeProvider implements ISubscriptionProvider {
   private stripe: Stripe;
 
   constructor() {
-    this.stripe = new Stripe(env.STRIPE_SECRET_KEY as string, {
-      apiVersion: "2023-10-16" as any,
+    this.stripe = new Stripe(env.STRIPE_SECRET_KEY!, {
+      apiVersion: "2023-10-16",
     });
   }
 
@@ -125,7 +126,7 @@ export class StripeProvider implements ISubscriptionProvider {
     const price = await this.stripe.prices.create({
       currency,
       unit_amount: amount,
-      recurring: { interval: interval as any },
+      recurring: { interval: interval as "day" | "week" | "month" | "year" },
       product_data: { name },
     });
     return price.id;
@@ -140,8 +141,8 @@ export class StripeProvider implements ISubscriptionProvider {
       expand: ["latest_invoice.payment_intent"],
     });
 
-    const invoice = subscription.latest_invoice as any;
-    const paymentIntent = invoice?.payment_intent as Stripe.PaymentIntent;
+    const invoice = subscription.latest_invoice as Stripe.Invoice | null;
+    const paymentIntent = invoice?.payment_intent as Stripe.PaymentIntent | null;
 
     return { 
       subscriptionId: subscription.id, 
@@ -156,6 +157,46 @@ import Razorpay from "razorpay";
 import { env } from "../../config/env";
 import { ISubscriptionProvider } from "./subscription.interface";
 
+interface RazorpayPlan {
+  id: string;
+  period: string;
+  interval: number;
+  item: {
+    id: string;
+    active: boolean;
+    amount: number;
+    unit_amount: number;
+    currency: string;
+    name: string;
+    description: string;
+  };
+  created_at: number;
+}
+
+interface RazorpaySubscription {
+  id: string;
+  plan_id: string;
+  status: string;
+  current_start: number | null;
+  current_end: number | null;
+  ended_at: number | null;
+  quantity: number;
+  notes: Record<string, string>;
+  charge_at: number;
+  total_count: number;
+  paid_count: number;
+  remaining_count: number;
+}
+
+interface RazorpayCustomer {
+  id: string;
+  name: string;
+  email: string;
+  contact: string;
+  gstin: string | null;
+  created_at: number;
+}
+
 export class RazorpayProvider implements ISubscriptionProvider {
   private razorpay: Razorpay;
 
@@ -167,7 +208,7 @@ export class RazorpayProvider implements ISubscriptionProvider {
   }
 
   async createCustomer(email: string, name: string): Promise<string> {
-    const customer = await this.razorpay.customers.create({ email, name });
+    const customer = await this.razorpay.customers.create({ email, name }) as unknown as RazorpayCustomer;
     return customer.id;
   }
 
@@ -181,7 +222,7 @@ export class RazorpayProvider implements ISubscriptionProvider {
         currency,
         description: name
       }
-    }) as any;
+    }) as unknown as RazorpayPlan;
     return plan.id;
   }
 
@@ -190,7 +231,7 @@ export class RazorpayProvider implements ISubscriptionProvider {
       plan_id: planId,
       customer_notify: 1,
       total_count: 12,
-    });
+    }) as unknown as RazorpaySubscription;
     return { subscriptionId: subscription.id };
   }
 }
@@ -234,6 +275,24 @@ export const subscriptionService = new SubscriptionService();
   files.set("razorpay.provider.ts", razorpayFile.getFullText());
   files.set("subscription.service.ts", serviceFile.getFullText());
 
+  for (const [name, content] of files.entries()) {
+    const anyMatches = content.match(/\bas\s+any\b/g);
+    if (anyMatches && anyMatches.length > 0) {
+      throw new Error(
+        `[Quality Gate] Generated file "${name}" contains ` +
+        `${anyMatches.length} "as any" cast(s). ` +
+        `This is a generator bug — fix the template before ` +
+        `writing to disk.\n\n` +
+        `Offending content preview:\n` +
+        content
+          .split("\n")
+          .filter(l => /\bas\s+any\b/.test(l))
+          .map(l => `  ${l.trim()}`)
+          .join("\n")
+      );
+    }
+  }
+
   return files;
 }
 
@@ -247,7 +306,7 @@ export const injectSubscriptionSystem: Tool<FastMCPSessionAuth, InjectSubscripti
     const projectRoot = path.resolve(targetSrcDirectory, "..");
 
     return withMutationReport("inject_subscription_system", dryRun ? null : projectRoot, async (report) => {
-      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
       if (dryRun) {
         report.humanMessage = `[INFO] DRY RUN: Will mutate schema.prisma and generate Strategy Providers in src/services/subscription/`;
         return;
@@ -269,7 +328,11 @@ export const injectSubscriptionSystem: Tool<FastMCPSessionAuth, InjectSubscripti
       // Snapshot existing files before overwriting
       const filePathsToWrite: string[] = [];
       for (const [name] of files.entries()) {
-        filePathsToWrite.push(path.join(subscriptionDir, name));
+        const filePath = path.join(subscriptionDir, name);
+        if (fs.existsSync(filePath)) {
+          throw new Error(`Guard: File already exists: "${filePath}".`);
+        }
+        filePathsToWrite.push(filePath);
       }
       report.snapshotFiles(filePathsToWrite);
 

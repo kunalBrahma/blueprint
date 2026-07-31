@@ -5,6 +5,7 @@ import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 
@@ -255,6 +256,24 @@ function injectRoute(
         }
     }
 
+    // ── Step C: Auto-import auth helpers if used ─────────────────────────────
+    if (handlerBody.includes("signIn") || handlerBody.includes("signUp")) {
+        const needed: string[] = [];
+        if (handlerBody.includes("signIn")) needed.push("signIn");
+        if (handlerBody.includes("signUp")) needed.push("signUp");
+
+        const hasAuthImport = sourceFile.getImportDeclarations().some(imp =>
+            imp.getNamedImports().some(n => needed.includes(n.getName()))
+        );
+
+        if (!hasAuthImport) {
+            sourceFile.addImportDeclaration({
+                namedImports: needed,
+                moduleSpecifier: "../controllers/auth.controller"
+            });
+        }
+    }
+
     sourceFile.fixUnusedIdentifiers();
     sourceFile.organizeImports();
     return sourceFile.getFullText();
@@ -374,7 +393,7 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
             const handlerBody = sanitizeHandlerBody(args.handlerBody);
 
             // ── Path Jail: validate all paths against project root ─────────────────
-            const safePath = enforcePathJail(projectRoot, resolvedPath);
+            const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
 
             // ── Validate target file ───────────────────────────────────────────────
             if (!fs.existsSync(safePath)) {
@@ -392,7 +411,7 @@ export const injectExpressRoute: Tool<FastMCPSessionAuth, InjectRouteParams> = {
                 if (!mountPath) {
                     throw new Error(`"mountPath" is required when "serverFile" is provided.`);
                 }
-                safeServerPath = enforcePathJail(projectRoot, path.resolve(serverFile));
+                safeServerPath = enforcePathJail(WORKSPACE_ROOT, path.resolve(serverFile));
                 if (!fs.existsSync(safeServerPath)) {
                     throw new Error(`serverFile not found: "${safeServerPath}"`);
                 }

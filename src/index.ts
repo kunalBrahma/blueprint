@@ -2,6 +2,7 @@ import { FastMCP } from "fastmcp";
 import { allTools, FREE_TOOL_NAMES, PRO_TOOL_NAMES } from "./tools/index.js";
 import { validateLicense } from "./utils/license.js";
 import { checkRateLimit } from "./utils/rateLimit.js";
+import { WORKSPACE_ROOT } from "./utils/workspace.js";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 
 // ─── Root Execution Guard ─────────────────────────────────────────────────────
@@ -100,8 +101,21 @@ for (const tool of allTools) {
     server.addTool(gatedTool as any);
 }
 
+// ─── Global Crash Protection ──────────────────────────────────────────────────
+// Catches any uncaught exceptions or unhandled promise rejections.
+// Logs to stderr ONLY — never stdout — to avoid corrupting the JSON-RPC channel.
+// Does NOT call process.exit() to allow in-flight responses to drain gracefully.
+process.on("uncaughtException", (err) => {
+    process.stderr.write(`[FATAL] Uncaught exception: ${err.message}\n${err.stack}\n`);
+});
+
+process.on("unhandledRejection", (reason) => {
+    process.stderr.write(`[FATAL] Unhandled rejection: ${String(reason)}\n`);
+});
+
 server.start({ transportType: "stdio" });
 
 console.error("Blueprint Architect MCP v4.0 running on stdio");
+console.error(`Blueprint Workspace Root: ${WORKSPACE_ROOT}`);
 console.error(`Free tools: ${[...FREE_TOOL_NAMES].join(", ")}`);
 console.error(`Pro tools:  ${[...PRO_TOOL_NAMES].join(", ")}`);

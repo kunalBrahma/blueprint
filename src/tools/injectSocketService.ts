@@ -7,6 +7,7 @@ import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectSocketSchema = z.object({
   serverFile: z.string().describe("Absolute path to the main application file (server.ts / app.ts)"),
@@ -85,14 +86,14 @@ export class SocketService {
   public joinRoom(socketId: string, room: string): void {
     const io = this.getIOOrNull();
     if (io) {
-      const sock = io.sockets.sockets.get(socketId as any) as Socket | undefined;
+      const sock = io.sockets.sockets.get(socketId) as Socket | undefined;
       sock?.join(room);
       return;
     }
     this.queuedActions.push(() => {
       const i = this.getIOOrNull();
       if (i) {
-        const s = i.sockets.sockets.get(socketId as any) as Socket | undefined;
+        const s = i.sockets.sockets.get(socketId) as Socket | undefined;
         s?.join(room);
       }
     });
@@ -104,7 +105,24 @@ export const socketService = new SocketService();
 
   sourceFile.fixUnusedIdentifiers();
   sourceFile.organizeImports();
-  return sourceFile.getFullText();
+  
+  const generated = sourceFile.getFullText();
+  const anyMatches = generated.match(/\bas\s+any\b/g);
+  if (anyMatches && anyMatches.length > 0) {
+    throw new Error(
+      `[Quality Gate] Generated file contains ` +
+      `${anyMatches.length} "as any" cast(s). ` +
+      `This is a generator bug — fix the template before ` +
+      `writing to disk.\n\n` +
+      `Offending content preview:\n` +
+      generated
+        .split("\n")
+        .filter(l => /\bas\s+any\b/.test(l))
+        .map(l => `  ${l.trim()}`)
+        .join("\n")
+    );
+  }
+  return generated;
 }
 
 function injectIntoServer(serverContent: string, serverPath: string, srcPath: string): string {
@@ -163,10 +181,32 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   const hasHttpCreate = stmts.some(stmt => stmt.getText().includes("http.createServer"));
 
   if (!hasHttpCreate && appInitIndex !== -1) {
-    sourceFile.insertStatements(appInitIndex + 1, `\n// Wrap Express app with HTTP server to support WebSockets\nconst server = http.createServer(${appVarName});\nsocketService.init(server);\n`);
+    // Case A: No HTTP server exists yet — create one and initialise socket service.
+    sourceFile.insertStatements(
+      appInitIndex + 1,
+      `\n// Wrap Express app with HTTP server to support WebSockets\nconst server = http.createServer(${appVarName});\nsocketService.init(server);\n`
+    );
+  } else if (hasHttpCreate) {
+    // Case B: An http.createServer(...) already exists —
+    // just ensure socketService.init(server) is called after it.
+    const alreadyInited = sourceFile.getStatements().some(s =>
+      s.getText().includes("socketService.init")
+    );
+    if (!alreadyInited) {
+      const httpCreateStmt = sourceFile.getStatements().find(s =>
+        s.getText().includes("http.createServer")
+      );
+      if (httpCreateStmt) {
+        sourceFile.insertStatements(
+          httpCreateStmt.getChildIndex() + 1,
+          `socketService.init(server);`
+        );
+      }
+    }
   }
 
-  stmts.forEach((stmt) => {
+  // Replace app.listen with server.listen on a fresh statement scan
+  sourceFile.getStatements().forEach((stmt) => {
     if (!Node.isExpressionStatement(stmt)) return;
     const expr = stmt.getExpression();
     if (!Node.isCallExpression(expr)) return;
@@ -191,22 +231,27 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
 
   execute: async (args) => {
     const { serverFile, targetSrcDirectory, dryRun } = args;
+
+    // STRICT PATH JAILING ENFORCED ON BOTH PATHS
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
-    const safeSrcDir = enforcePathJail(path.resolve(resolvedSrcDir, ".."), resolvedSrcDir);
-    const projectRoot = path.resolve(resolvedSrcDir, "..");
+    const safeServerPath = enforcePathJail(WORKSPACE_ROOT, resolvedServerPath);
+    const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
+
+    const projectRoot = path.resolve(safeSrcDir, "..");
 
     return withMutationReport("inject_socket_service", dryRun ? null : projectRoot, async (report) => {
-      if (!fs.existsSync(resolvedServerPath)) throw new Error(`serverFile not found: "${resolvedServerPath}"`);
-      if (!fs.existsSync(resolvedSrcDir)) throw new Error(`src directory not found: "${resolvedSrcDir}"`);
+      // USING ONLY SAFE PATHS FOR ALL FS OPERATIONS
+      if (!fs.existsSync(safeServerPath)) throw new Error(`serverFile not found: "${safeServerPath}"`);
+      if (!fs.existsSync(safeSrcDir)) throw new Error(`src directory not found: "${safeSrcDir}"`);
 
-      const servicesDir = path.join(resolvedSrcDir, "services");
+      const servicesDir = path.join(safeSrcDir, "services");
       const socketPath = path.join(servicesDir, "socket.service.ts");
 
       if (fs.existsSync(socketPath)) throw new Error(`Guard: File exists: "${socketPath}"`);
 
-      const serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
-      const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
+      const serverContent = fs.readFileSync(safeServerPath, "utf-8");
+      const modifiedServer = injectIntoServer(serverContent, safeServerPath, safeSrcDir);
       const socketContent = buildSocketService();
 
       if (dryRun) {
@@ -219,14 +264,14 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
 
       if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
 
-      report.snapshotFiles([socketPath, resolvedServerPath]);
-
+      report.snapshotFiles([socketPath, safeServerPath]);
 
       fs.writeFileSync(socketPath, socketContent, "utf-8");
       report.mutatedFiles.push(socketPath);
-      fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
-      report.mutatedFiles.push(resolvedServerPath);
+      fs.writeFileSync(safeServerPath, modifiedServer, "utf-8");
+      report.mutatedFiles.push(safeServerPath);
 
+      // Kept auto-install for now, but with 'pipe' safety intact as per the previous fix.
       let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  socket.io`;
       try {
         const cwd = projectRoot;
@@ -238,18 +283,17 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
           const allDeps = { ...(pkgJson.dependencies || {}), ...(pkgJson.devDependencies || {}) };
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
+
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install -D ${needDev.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
 
           try {
             recordInstalledPackages(cwd, [...pkgs, ...devPkgs]);
-          } catch (_) {
-            // best-effort
-          }
+          } catch (_) { }
         }
       } catch (err: unknown) {
         packageWarnings = `\n\n[WARNING] Failed to auto-install packages. Please manually run:\n  npm install socket.io\n  npm install -D @types/socket.io`;

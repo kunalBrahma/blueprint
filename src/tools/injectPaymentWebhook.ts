@@ -7,6 +7,7 @@ import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { recordInstalledPackages } from "./sdkVersions.js";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectPaymentWebhookSchema = z.object({
   targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -27,9 +28,24 @@ import prisma from "../config/prisma";
 import { env } from "../config/env";
 import { socketService } from "../services/socket.service";
 
-const stripe = new Stripe(env.STRIPE_SECRET_KEY as string, {
-  apiVersion: "2023-10-16" as any,
+const stripe = new Stripe(env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2023-10-16",
 });
+
+interface RazorpayWebhookPayload {
+  event: string;
+  payload: {
+    payment: {
+      entity: Record<string, unknown>;
+    };
+    subscription: {
+      entity: {
+        id: string;
+        current_end: number;
+      };
+    };
+  };
+}
 
 async function handleStripeEvent(req: Request, res: Response): Promise<void> {
   const sig = req.headers["stripe-signature"];
@@ -39,21 +55,22 @@ async function handleStripeEvent(req: Request, res: Response): Promise<void> {
 
   try {
     event = stripe.webhooks.constructEvent(req.body, sig as string, endpointSecret);
-  } catch (err: any) {
-    res.status(400).send("Webhook Error: " + (err && (err as any).message ? (err as any).message : String(err)));
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(400).send("Webhook Error: " + msg);
     return;
   }
 
   if (event.type === "invoice.payment_succeeded") {
-    const invoice = event.data.object as any;
-    const subscriptionId = invoice.subscription as string;
+    const invoice = event.data.object as Stripe.Invoice;
+    const subscriptionId = invoice.subscription as string | null;
 
     if (subscriptionId) {
       const sub = await prisma.subscription.update({
         where: { gatewaySubscriptionId: subscriptionId },
         data: {
           status: "ACTIVE",
-          currentPeriodEnd: new Date(invoice.lines.data[0].period.end * 1000),
+          currentPeriodEnd: new Date((invoice.lines.data[0]?.period.end || 0) * 1000),
         },
       });
 
@@ -104,9 +121,9 @@ async function handleRazorpayEvent(req: Request, res: Response): Promise<void> {
   }
 
   if (event.event === "subscription.charged") {
-    const paymentEntity = event.payload.payment.entity;
-    const subscriptionId = event.payload.subscription.entity.id;
-    const endAt = event.payload.subscription.entity.current_end;
+    const payload = event as RazorpayWebhookPayload;
+    const subscriptionId = payload.payload.subscription.entity.id;
+    const endAt = payload.payload.subscription.entity.current_end;
 
     if (subscriptionId) {
       const sub = await prisma.subscription.update({
@@ -143,21 +160,30 @@ export async function paymentWebhook(req: Request, res: Response): Promise<void>
     return handleRazorpayEvent(req, res);
   }
 
-  try {
-    return await handleStripeEvent(req, res);
-  } catch (e) {
-    try {
-      return await handleRazorpayEvent(req, res);
-    } catch (err) {
-      res.status(400).send("Unable to determine webhook provider or validate signature.");
-    }
-  }
+  res.status(400).send("Unable to determine webhook provider. Please provide a provider name in the path or x-provider header.");
 }
 `.trimStart());
 
   sourceFile.fixUnusedIdentifiers();
   sourceFile.organizeImports();
-  return sourceFile.getFullText();
+
+  const generated = sourceFile.getFullText();
+  const anyMatches = generated.match(/\bas\s+any\b/g);
+  if (anyMatches && anyMatches.length > 0) {
+    throw new Error(
+      `[Quality Gate] Generated file contains ` +
+      `${anyMatches.length} "as any" cast(s). ` +
+      `This is a generator bug — fix the template before ` +
+      `writing to disk.\n\n` +
+      `Offending content preview:\n` +
+      generated
+        .split("\n")
+        .filter(l => /\bas\s+any\b/.test(l))
+        .map(l => `  ${l.trim()}`)
+        .join("\n")
+    );
+  }
+  return generated;
 }
 
 function buildWebhookRoute(): string {
@@ -195,7 +221,7 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
     const projectRoot = path.resolve(srcDir, "..");
 
     return withMutationReport("inject_payment_webhook", dryRun ? null : projectRoot, async (report) => {
-      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
       if (!fs.existsSync(safeSrcDir)) {
         throw new Error(`Directory not found: "${safeSrcDir}"`);
       }
@@ -231,7 +257,7 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
       try {
         const cwd = projectRoot;
         if (fs.existsSync(path.join(cwd, "package.json"))) {
-          execSync("npm install stripe razorpay --no-save --save-exact", { cwd, stdio: "inherit", timeout: 30000 });
+          execSync("npm install stripe razorpay --save-exact", { cwd, stdio: "pipe", timeout: 30000 });
           packageWarnings += "  stripe razorpay";
           try {
             recordInstalledPackages(cwd, ["stripe", "razorpay"]);

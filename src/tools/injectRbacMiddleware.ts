@@ -5,6 +5,7 @@ import { Project, Node } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 // ─── 1. Constants ──────────────────────────────────────────────────────────────
 
@@ -34,9 +35,9 @@ const injectRbacSchema = z.object({
 
 type InjectRbacParams = typeof injectRbacSchema;
 
-// ─── 3. The requireRoles Middleware Template ───────────────────────────────────
-
 const REQUIRE_ROLES_TEMPLATE = `
+import { Request, Response, NextFunction } from "express";
+
 export interface AuthRequest extends Request {
   user?: { role?: string; [key: string]: unknown };
 }
@@ -54,31 +55,6 @@ export function requireRoles(roles: string[]) {
 `.trimStart();
 
 // ─── 4. AST Helpers ───────────────────────────────────────────────────────────
-
-function ensureExpressTypeImports(
-    sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>
-): void {
-    const expressImport = sourceFile.getImportDeclaration(
-        (imp) => imp.getModuleSpecifierValue() === "express"
-    );
-
-    const needed = ["Request", "Response", "NextFunction"];
-
-    if (!expressImport) {
-        sourceFile.addImportDeclaration({
-            namedImports: needed,
-            moduleSpecifier: "express",
-        });
-        return;
-    }
-
-    const existingNames = expressImport.getNamedImports().map((n) => n.getName());
-    const missingNames = needed.filter((n) => !existingNames.includes(n));
-
-    if (missingNames.length > 0) {
-        expressImport.addNamedImports(missingNames);
-    }
-}
 
 function hasRequireRoles(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>
@@ -125,7 +101,8 @@ function injectRbac(
     filePath: string,
     method: string,
     routePath: string,
-    allowedRoles: string[]
+    allowedRoles: string[],
+    safeSrcDir: string
 ): { result: string; action: string } {
     const project = new Project({
         useInMemoryFileSystem: true,
@@ -136,13 +113,27 @@ function injectRbac(
         overwrite: true,
     });
 
+    // 1. Ensure shared middleware exists
+    const middlewareDir = path.join(safeSrcDir, "middleware");
+    const rbacMiddlewarePath = path.join(middlewareDir, "rbac.ts");
+    if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
+    if (!fs.existsSync(rbacMiddlewarePath)) {
+        fs.writeFileSync(rbacMiddlewarePath, REQUIRE_ROLES_TEMPLATE, "utf-8");
+    }
+
+    // 2. Add import to target file
+    const relPath = path.relative(path.dirname(filePath), rbacMiddlewarePath).replace(/\.ts$/, "").replace(/\\/g, "/");
+    const importPath = relPath.startsWith(".") ? relPath : `./${relPath}`;
+
     let middlewareAction = "";
     if (!hasRequireRoles(sourceFile)) {
-        ensureExpressTypeImports(sourceFile);
-        sourceFile.insertStatements(0, `\n${REQUIRE_ROLES_TEMPLATE}`);
-        middlewareAction = "injected requireRoles middleware into file";
+        sourceFile.addImportDeclaration({
+            namedImports: ["requireRoles"],
+            moduleSpecifier: importPath
+        });
+        middlewareAction = `injected requireRoles import from ${importPath}`;
     } else {
-        middlewareAction = "requireRoles already present — skipped injection";
+        middlewareAction = "requireRoles already present (inline or import) — skipped import";
     }
 
     const routeCall = findRouteCall(sourceFile, method, routePath);
@@ -197,7 +188,7 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
         const projectRoot = path.resolve(resolvedPath, "../../..");
 
         return withMutationReport("inject_rbac_middleware", dryRun ? null : projectRoot, async (report) => {
-            const safePath = enforcePathJail(projectRoot, resolvedPath);
+            const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
 
             if (!fs.existsSync(safePath)) {
                 throw new Error(`File not found: "${safePath}"`);
@@ -224,7 +215,8 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 safePath,
                 method,
                 routePath,
-                allowedRoles
+                allowedRoles,
+                path.dirname(path.dirname(safePath)) // Infer src dir
             ));
 
             if (dryRun) {

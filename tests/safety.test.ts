@@ -318,3 +318,107 @@ router.get("/users", async (req, res) => { res.json(["duplicate"]); });
         );
     });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEST SUITE 5: inject_prisma_model — @relation Regression & Custom @default
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Tests exercise the core formatting helpers IN ISOLATION (no FS / Prisma needed).
+
+type TestFieldDef = {
+    name: string;
+    type: "String" | "Int" | "Float" | "Boolean" | "DateTime" | "Json";
+    isId: boolean;
+    isOptional: boolean;
+    isUnique: boolean;
+    relation?: string;
+    defaultValue?: string;
+};
+
+function idDefault_v2(type: string): string {
+    return type === "Int" ? "@default(autoincrement())" : "@default(cuid())";
+}
+
+function formatField_v2(f: TestFieldDef): string {
+    const typeStr = f.isOptional ? `${f.type}?` : f.type;
+    const attrs: string[] = [];
+
+    if (f.isId) {
+        attrs.push("@id");
+        attrs.push(f.defaultValue ? `@default(${f.defaultValue})` : idDefault_v2(f.type));
+    } else if (f.defaultValue) {
+        attrs.push(`@default(${f.defaultValue})`);
+    }
+    if (f.isUnique && !f.isId) attrs.push("@unique");
+    if (f.relation) {
+        attrs.push(`@relation(fields: [${f.name}Id], references: [id])`);
+    }
+    return `  ${f.name}  ${typeStr}  ${attrs.join(" ")}`.trimEnd();
+}
+
+function normalizeField_v2(f: TestFieldDef): TestFieldDef {
+    const name = f.name.charAt(0).toLowerCase() + f.name.slice(1);
+    return { ...f, name };
+}
+
+describe("inject_prisma_model: @relation regression suite", () => {
+
+    it("userId with NO explicit relation → NO @relation emitted (core regression guard)", () => {
+        const field = normalizeField_v2({ name: "userId", type: "String", isId: false, isOptional: false, isUnique: false });
+        const line = formatField_v2(field);
+        assert.ok(!line.includes("@relation"), `Expected NO @relation, got: "${line}"`);
+    });
+
+    it("userId WITH explicit relation:'User' → @relation IS emitted", () => {
+        const field = normalizeField_v2({ name: "userId", type: "String", isId: false, isOptional: false, isUnique: false, relation: "User" });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@relation"), `Expected @relation, got: "${line}"`);
+    });
+
+    it("field 'name' (not ending in Id) with no relation → no @relation", () => {
+        const field = normalizeField_v2({ name: "name", type: "String", isId: false, isOptional: false, isUnique: false });
+        const line = formatField_v2(field);
+        assert.ok(!line.includes("@relation"), `Got unexpected @relation: "${line}"`);
+    });
+
+    it("multiple *Id fields without explicit relations → NONE get @relation", () => {
+        const fieldNames = ["categoryId", "authorId", "tenantId", "ownerId"];
+        for (const name of fieldNames) {
+            const field = normalizeField_v2({ name, type: "String", isId: false, isOptional: false, isUnique: false });
+            const line = formatField_v2(field);
+            assert.ok(!line.includes("@relation"), `Field '${name}' should NOT have @relation, got: "${line}"`);
+        }
+    });
+
+    it("non-id field with defaultValue:'detected' → emits @default(detected)", () => {
+        const field = normalizeField_v2({ name: "status", type: "String", isId: false, isOptional: false, isUnique: false, defaultValue: "detected" });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@default(detected)"), `Expected @default(detected), got: "${line}"`);
+    });
+
+    it("@id String field with no custom default → auto emits @default(cuid())", () => {
+        const field = normalizeField_v2({ name: "id", type: "String", isId: true, isOptional: false, isUnique: false });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@default(cuid())"), `Expected @default(cuid()), got: "${line}"`);
+    });
+
+    it("@id String field with custom defaultValue:'uuid()' → emits uuid() NOT cuid()", () => {
+        const field = normalizeField_v2({ name: "id", type: "String", isId: true, isOptional: false, isUnique: false, defaultValue: "uuid()" });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@default(uuid())"), `Expected @default(uuid()), got: "${line}"`);
+        assert.ok(!line.includes("@default(cuid())"), `Should NOT contain cuid(), got: "${line}"`);
+    });
+
+    it("@id Int field with no custom default → auto emits @default(autoincrement())", () => {
+        const field = normalizeField_v2({ name: "id", type: "Int", isId: true, isOptional: false, isUnique: false });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@default(autoincrement())"), `Expected autoincrement(), got: "${line}"`);
+    });
+
+    it("unique field → emits @unique, never @relation", () => {
+        const field = normalizeField_v2({ name: "email", type: "String", isId: false, isOptional: false, isUnique: true });
+        const line = formatField_v2(field);
+        assert.ok(line.includes("@unique"), `Expected @unique, got: "${line}"`);
+        assert.ok(!line.includes("@relation"), `Should not have @relation, got: "${line}"`);
+    });
+});

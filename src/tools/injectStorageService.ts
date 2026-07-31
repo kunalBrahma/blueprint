@@ -6,6 +6,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 // ─── 1. Zod Schema ────────────────────────────────────────────────────────────
 const injectStorageSchema = z.object({
@@ -27,7 +28,8 @@ function buildMulterMiddleware(): string {
   const sourceFile = project.createSourceFile("upload.ts", "", { overwrite: true });
 
   sourceFile.addStatements(`
-import multer, { FileFilterCallback } from "multer";
+import * as multer from "multer";
+import { FileFilterCallback } from "multer";
 import { Request } from "express";
 import * as path from "node:path";
 
@@ -192,7 +194,7 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
     const projectRoot = path.resolve(srcDir, "..");
 
     return withMutationReport("inject_storage_service", dryRun ? null : projectRoot, async (report) => {
-      const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
       if (!fs.existsSync(safeSrcDir)) {
         throw new Error(`Directory not found: "${safeSrcDir}"`);
       }
@@ -250,10 +252,10 @@ export const injectStorageService: Tool<FastMCPSessionAuth, InjectStorageParams>
           const need = pkgs.filter(p => !allDeps[p]);
           const needDev = devPkgs.filter(p => !allDeps[p]);
           if (need.length > 0) {
-            execSync(`npm install ${need.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install ${need.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
           if (needDev.length > 0) {
-            execSync(`npm install -D ${needDev.join(" ")} --no-save --save-exact`, { cwd, stdio: "inherit", timeout: 30000 });
+            execSync(`npm install -D ${needDev.join(" ")} --save-exact`, { cwd, stdio: "pipe", timeout: 30000 });
           }
         }
       } catch (err: unknown) {

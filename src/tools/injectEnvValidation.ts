@@ -5,6 +5,7 @@ import { Project } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
+import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectEnvSchema = z.object({
     targetSrcDirectory: z.string().describe("Absolute path to the src folder"),
@@ -81,7 +82,7 @@ export const injectEnvValidation: Tool<FastMCPSessionAuth, InjectEnvParams> = {
         const projectRoot = path.resolve(targetSrcDirectory, "..");
 
         return withMutationReport("inject_env_validation", dryRun ? null : projectRoot, async (report) => {
-            const safeSrcDir = enforcePathJail(projectRoot, path.resolve(targetSrcDirectory));
+            const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
             const configDir = path.resolve(safeSrcDir, "config");
             const filePath = path.join(configDir, "env.ts");
             const envFilePath = path.join(projectRoot, ".env");
