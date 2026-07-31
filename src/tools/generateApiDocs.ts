@@ -70,9 +70,19 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   const project = new Project({ useInMemoryFileSystem: true });
   const sourceFile = project.createSourceFile(serverPath, serverContent, { overwrite: true });
 
-  const hasSwaggerUi = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "swagger-ui-express");
-  if (!hasSwaggerUi) {
-    sourceFile.insertStatements(0, `import swaggerUi from "swagger-ui-express";`);
+  // Reuse the project's existing local alias for swagger-ui-express if it's
+  // already imported under a different name (e.g. `import ui from "..."`),
+  // instead of assuming the default alias and referencing an undefined
+  // identifier in the generated mount statement.
+  let swaggerUiAlias = "swaggerUi";
+  const existingSwaggerImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "swagger-ui-express");
+  if (existingSwaggerImport) {
+    const defaultImport = existingSwaggerImport.getDefaultImport();
+    if (defaultImport) {
+      swaggerUiAlias = defaultImport.getText();
+    }
+  } else {
+    sourceFile.insertStatements(0, `import ${swaggerUiAlias} from "swagger-ui-express";`);
   }
 
   const relImport = (() => {
@@ -112,7 +122,7 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   appVarName = appCandidates[0]!;
 
   const swaggerRoute = `/api-docs`;
-  const useStmt = `\n// Serve Swagger API Documentation\n${appVarName}.use("${swaggerRoute}", swaggerUi.serve, swaggerUi.setup(swaggerSpec));\n`;
+  const useStmt = `\n// Serve Swagger API Documentation\n${appVarName}.use("${swaggerRoute}", ${swaggerUiAlias}.serve, ${swaggerUiAlias}.setup(swaggerSpec));\n`;
   const alreadyMounted = sourceFile.getStatements().some(stmt => stmt.getText().includes(swaggerRoute));
 
   if (!alreadyMounted) {
@@ -123,7 +133,14 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
       const expr = stmt.getExpression();
       if (!Node.isCallExpression(expr)) return;
       const callee = expr.getExpression();
-      if (Node.isPropertyAccessExpression(callee) && callee.getExpression().getText() === appVarName) {
+      // Only track `.use(...)` calls on the app instance, not `.listen(...)`
+      // or other methods — inserting after `.listen()` would mount the docs
+      // route after the server has already started listening.
+      if (
+        Node.isPropertyAccessExpression(callee) &&
+        callee.getExpression().getText() === appVarName &&
+        callee.getName() === "use"
+      ) {
         lastAppUseIndex = i;
       }
     });
@@ -149,20 +166,24 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
     const { serverFile, targetSrcDirectory, dryRun } = args;
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
-    const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
     const projectRoot = path.resolve(resolvedSrcDir, "..");
 
     return withMutationReport("generate_api_docs", dryRun ? null : projectRoot, async (report) => {
-      if (!fs.existsSync(resolvedServerPath)) throw new Error(`serverFile not found: "${resolvedServerPath}"`);
-      if (!fs.existsSync(resolvedSrcDir)) throw new Error(`src directory not found: "${resolvedSrcDir}"`);
+      // Jail checks live inside the action so a violation produces the tool's
+      // normal structured JSON error result instead of an unhandled throw.
+      const safeServerPath = enforcePathJail(WORKSPACE_ROOT, resolvedServerPath);
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
 
-      const configDir = path.join(resolvedSrcDir, "config");
+      if (!fs.existsSync(safeServerPath)) throw new Error(`serverFile not found: "${safeServerPath}"`);
+      if (!fs.existsSync(safeSrcDir)) throw new Error(`src directory not found: "${safeSrcDir}"`);
+
+      const configDir = path.join(safeSrcDir, "config");
       const swaggerPath = path.join(configDir, "swagger.ts");
 
       if (fs.existsSync(swaggerPath)) throw new Error(`Guard: File exists: "${swaggerPath}"`);
 
-      const serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
-      const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
+      const serverContent = fs.readFileSync(safeServerPath, "utf-8");
+      const modifiedServer = injectIntoServer(serverContent, safeServerPath, safeSrcDir);
       const swaggerContent = buildSwaggerConfig();
 
       if (dryRun) {
@@ -175,13 +196,13 @@ export const generateApiDocs: Tool<FastMCPSessionAuth, GenerateDocsParams> = {
 
       if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
 
-      report.snapshotFiles([swaggerPath, resolvedServerPath]);
+      report.snapshotFiles([swaggerPath, safeServerPath]);
 
 
       fs.writeFileSync(swaggerPath, swaggerContent, "utf-8");
       report.mutatedFiles.push(swaggerPath);
-      fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
-      report.mutatedFiles.push(resolvedServerPath);
+      fs.writeFileSync(safeServerPath, modifiedServer, "utf-8");
+      report.mutatedFiles.push(safeServerPath);
 
       let packageWarnings = `\n\n[INFO] Packages automatically installed:\n  swagger-jsdoc swagger-ui-express`;
       try {

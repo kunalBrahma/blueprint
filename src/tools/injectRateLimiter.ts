@@ -28,12 +28,12 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
 
         return withMutationReport("inject_rate_limiter", dryRun ? null : projectRoot, async (report) => {
             const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
-            if (!fs.existsSync(resolvedPath)) {
-                throw new Error(`File not found: "${resolvedPath}"`);
+            if (!fs.existsSync(safePath)) {
+                throw new Error(`File not found: "${safePath}"`);
             }
 
             const project = new Project({ useInMemoryFileSystem: true });
-            const sourceFile = project.createSourceFile(resolvedPath, fs.readFileSync(resolvedPath, "utf-8"), { overwrite: true });
+            const sourceFile = project.createSourceFile(safePath, fs.readFileSync(safePath, "utf-8"), { overwrite: true });
 
             const safeSrcDir = path.dirname(path.dirname(safePath));
             const redisServicePath = path.resolve(safeSrcDir, "services/redis.service.ts");
@@ -41,9 +41,36 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
                 throw new Error("Redis service not found. Please run inject_redis_service first.");
             }
 
-            const hasRateLimit = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "express-rate-limit");
-            if (!hasRateLimit) {
-                sourceFile.insertStatements(0, `import rateLimit from "express-rate-limit";\nimport { RedisStore } from "rate-limit-redis";\nimport redisClient from "../services/redis.service";`);
+            // Check each import independently rather than gating all three
+            // behind a single "has express-rate-limit" check — previously, a
+            // file that already imported `redisClient` for unrelated reasons
+            // (but lacked express-rate-limit) would get a second, duplicate
+            // `redisClient` import declaration.
+            const importWarnings: string[] = [];
+            const importsToAdd: string[] = [];
+
+            const hasRateLimitImport = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "express-rate-limit");
+            if (!hasRateLimitImport) {
+                importsToAdd.push(`import rateLimit from "express-rate-limit";`);
+            }
+
+            const hasRedisStoreImport = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "rate-limit-redis");
+            if (!hasRedisStoreImport) {
+                importsToAdd.push(`import { RedisStore } from "rate-limit-redis";`);
+            }
+
+            const existingRedisClientImport = sourceFile.getImportDeclarations().find(imp => {
+                const def = imp.getDefaultImport();
+                return def && def.getText() === "redisClient";
+            });
+            if (!existingRedisClientImport) {
+                importsToAdd.push(`import redisClient from "../services/redis.service";`);
+            } else if (existingRedisClientImport.getModuleSpecifierValue() !== "../services/redis.service") {
+                importWarnings.push(`[WARNING] 'redisClient' is already imported from '${existingRedisClientImport.getModuleSpecifierValue()}'. Reusing that binding instead of importing from '../services/redis.service'.`);
+            }
+
+            if (importsToAdd.length > 0) {
+                sourceFile.insertStatements(0, importsToAdd.join("\n"));
             }
 
             const limiterVarName = "authLimiter";
@@ -111,13 +138,14 @@ export const injectRateLimiter: Tool<FastMCPSessionAuth, InjectRateLimiterParams
                 report.status = "PARTIAL_FAILURE";
             }
 
-            report.snapshotFiles([resolvedPath]);
+            report.snapshotFiles([safePath]);
 
 
-            fs.writeFileSync(resolvedPath, sourceFile.getFullText(), "utf-8");
-            report.mutatedFiles.push(resolvedPath);
+            fs.writeFileSync(safePath, sourceFile.getFullText(), "utf-8");
+            report.mutatedFiles.push(safePath);
 
-            report.humanMessage = `[SUCCESS] Rate Limiter injected into ${injectedCount} route(s)!\nFile updated: ${resolvedPath}${packageWarnings}`;
+            const importWarningsText = importWarnings.length > 0 ? `\n\n${importWarnings.join("\n")}` : "";
+            report.humanMessage = `[SUCCESS] Rate Limiter injected into ${injectedCount} route(s)!\nFile updated: ${safePath}${packageWarnings}${importWarningsText}`;
         });
     },
 };

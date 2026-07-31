@@ -129,8 +129,27 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   const project = new Project({ useInMemoryFileSystem: true });
   const sourceFile = project.createSourceFile(serverPath, serverContent, { overwrite: true });
 
-  const hasHttp = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "node:http" || imp.getModuleSpecifierValue() === "http");
-  if (!hasHttp) {
+  // Reuse the project's existing local alias for the http module if it's
+  // already imported under a namespace/default binding (e.g.
+  // `import * as httpLib from "node:http"`), instead of assuming the
+  // default "http" alias and referencing an undefined identifier below.
+  let httpAlias = "http";
+  const existingHttpImport = sourceFile.getImportDeclarations().find(imp => imp.getModuleSpecifierValue() === "node:http" || imp.getModuleSpecifierValue() === "http");
+  let needOwnHttpImport = true;
+  if (existingHttpImport) {
+    const ns = existingHttpImport.getNamespaceImport();
+    const def = existingHttpImport.getDefaultImport();
+    if (ns) {
+      httpAlias = ns.getText();
+      needOwnHttpImport = false;
+    } else if (def) {
+      httpAlias = def.getText();
+      needOwnHttpImport = false;
+    }
+    // else: only named imports (e.g. `{ createServer }`) exist — no usable
+    // namespace/default alias is bound, so we still add our own import below.
+  }
+  if (needOwnHttpImport) {
     sourceFile.insertStatements(0, `import * as http from "node:http";`);
   }
 
@@ -178,34 +197,52 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
   appVarName = appCandidates[0]!.name;
   appInitIndex = appCandidates[0]!.index;
 
-  const hasHttpCreate = stmts.some(stmt => stmt.getText().includes("http.createServer"));
+  const httpCreatePattern = `${httpAlias}.createServer`;
+  const hasHttpCreate = stmts.some(stmt => stmt.getText().includes(httpCreatePattern));
+
+  // The variable name the HTTP server ends up bound to — used consistently
+  // below for both the socketService.init(...) call and the app.listen →
+  // X.listen rewrite. Defaults to "server" (Case A, where we create it
+  // ourselves), but in Case B must be read from the existing declaration
+  // rather than assumed, since a very common pattern is
+  // `const httpServer = http.createServer(app);`, not `const server = ...`.
+  let httpServerVarName = "server";
 
   if (!hasHttpCreate && appInitIndex !== -1) {
     // Case A: No HTTP server exists yet — create one and initialise socket service.
     sourceFile.insertStatements(
       appInitIndex + 1,
-      `\n// Wrap Express app with HTTP server to support WebSockets\nconst server = http.createServer(${appVarName});\nsocketService.init(server);\n`
+      `\n// Wrap Express app with HTTP server to support WebSockets\nconst ${httpServerVarName} = ${httpAlias}.createServer(${appVarName});\nsocketService.init(${httpServerVarName});\n`
     );
   } else if (hasHttpCreate) {
-    // Case B: An http.createServer(...) already exists —
-    // just ensure socketService.init(server) is called after it.
+    // Case B: An http.createServer(...) already exists — read the actual
+    // variable name it's bound to, then ensure socketService.init(...) is
+    // called with that name after it.
+    const httpCreateStmt = sourceFile.getStatements().find(s =>
+      s.getText().includes(httpCreatePattern)
+    );
+    if (httpCreateStmt && Node.isVariableStatement(httpCreateStmt)) {
+      for (const decl of httpCreateStmt.getDeclarations()) {
+        const init = decl.getInitializer();
+        if (init && init.getText().includes(httpCreatePattern)) {
+          httpServerVarName = decl.getName();
+          break;
+        }
+      }
+    }
+
     const alreadyInited = sourceFile.getStatements().some(s =>
       s.getText().includes("socketService.init")
     );
-    if (!alreadyInited) {
-      const httpCreateStmt = sourceFile.getStatements().find(s =>
-        s.getText().includes("http.createServer")
+    if (!alreadyInited && httpCreateStmt) {
+      sourceFile.insertStatements(
+        httpCreateStmt.getChildIndex() + 1,
+        `socketService.init(${httpServerVarName});`
       );
-      if (httpCreateStmt) {
-        sourceFile.insertStatements(
-          httpCreateStmt.getChildIndex() + 1,
-          `socketService.init(server);`
-        );
-      }
     }
   }
 
-  // Replace app.listen with server.listen on a fresh statement scan
+  // Replace app.listen with <httpServerVarName>.listen on a fresh statement scan
   sourceFile.getStatements().forEach((stmt) => {
     if (!Node.isExpressionStatement(stmt)) return;
     const expr = stmt.getExpression();
@@ -215,7 +252,7 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     if (Node.isPropertyAccessExpression(callee) &&
       callee.getExpression().getText() === appVarName &&
       callee.getName() === "listen") {
-      callee.getExpression().replaceWithText("server");
+      callee.getExpression().replaceWithText(httpServerVarName);
     }
   });
 
@@ -232,16 +269,17 @@ export const injectSocketService: Tool<FastMCPSessionAuth, InjectSocketParams> =
   execute: async (args) => {
     const { serverFile, targetSrcDirectory, dryRun } = args;
 
-    // STRICT PATH JAILING ENFORCED ON BOTH PATHS
     const resolvedServerPath = path.resolve(serverFile);
     const resolvedSrcDir = path.resolve(targetSrcDirectory);
-    const safeServerPath = enforcePathJail(WORKSPACE_ROOT, resolvedServerPath);
-    const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
-
-    const projectRoot = path.resolve(safeSrcDir, "..");
+    const projectRoot = path.resolve(resolvedSrcDir, "..");
 
     return withMutationReport("inject_socket_service", dryRun ? null : projectRoot, async (report) => {
-      // USING ONLY SAFE PATHS FOR ALL FS OPERATIONS
+      // Jail checks live inside the action so a violation produces the
+      // tool's normal structured JSON error result instead of an unhandled
+      // throw before withMutationReport's try/catch is even entered.
+      const safeServerPath = enforcePathJail(WORKSPACE_ROOT, resolvedServerPath);
+      const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
+
       if (!fs.existsSync(safeServerPath)) throw new Error(`serverFile not found: "${safeServerPath}"`);
       if (!fs.existsSync(safeSrcDir)) throw new Error(`src directory not found: "${safeSrcDir}"`);
 

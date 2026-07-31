@@ -50,6 +50,9 @@ function updatePrismaSchema(targetSrcDirectory: string, report: { mutatedFiles: 
     schemaContent = lines.join("\n");
   }
 
+  // Check for Plan and Subscription independently — a schema that already has
+  // one but not the other (e.g. from a partial prior run) must not get a
+  // second, duplicate copy of the model it already has.
   if (!schemaContent.includes("model Plan")) {
     schemaContent += `
 model Plan {
@@ -62,7 +65,11 @@ model Plan {
   razorpayPlanId   String?
   subscriptions    Subscription[]
 }
+`;
+  }
 
+  if (!schemaContent.includes("model Subscription")) {
+    schemaContent += `
 model Subscription {
   id                    String   @id @default(cuid())
   userId                String
@@ -78,8 +85,7 @@ model Subscription {
 `;
   }
 
-
-
+  const backup = fs.existsSync(schemaPath) ? fs.readFileSync(schemaPath, "utf-8") : null;
   fs.writeFileSync(schemaPath, schemaContent, "utf-8");
   report.mutatedFiles.push(schemaPath);
 
@@ -87,7 +93,19 @@ model Subscription {
     execSync("npx prisma generate", { stdio: "pipe", timeout: 30000, cwd: path.resolve(targetSrcDirectory, "..") });
     return "[SUCCESS] Prisma schema updated and client generated.";
   } catch (err: unknown) {
-    return `[WARNING] Prisma schema updated but 'npx prisma generate' failed: ${err}`;
+    // Atomic rollback: a failed `prisma generate` means the schema we just
+    // wrote is invalid (e.g. duplicate model). Restore it and throw so the
+    // caller reports a real ERROR instead of a SUCCESS with a buried
+    // warning — tsc validation on the generated .ts files has nothing to
+    // catch this, since none of them reference prisma.plan/subscription.
+    if (backup !== null) {
+      try {
+        fs.writeFileSync(schemaPath, backup, "utf-8");
+      } catch {
+        throw new Error(`'npx prisma generate' failed AND rollback of schema.prisma also failed. Manual intervention required. Original error: ${err}`);
+      }
+    }
+    throw new Error(`'npx prisma generate' failed after updating schema.prisma; schema.prisma has been reverted to its previous state.\n${String(err)}`);
   }
 }
 

@@ -102,7 +102,7 @@ function injectRbac(
     method: string,
     routePath: string,
     allowedRoles: string[],
-    safeSrcDir: string
+    rbacMiddlewarePath: string
 ): { result: string; action: string } {
     const project = new Project({
         useInMemoryFileSystem: true,
@@ -113,15 +113,10 @@ function injectRbac(
         overwrite: true,
     });
 
-    // 1. Ensure shared middleware exists
-    const middlewareDir = path.join(safeSrcDir, "middleware");
-    const rbacMiddlewarePath = path.join(middlewareDir, "rbac.ts");
-    if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
-    if (!fs.existsSync(rbacMiddlewarePath)) {
-        fs.writeFileSync(rbacMiddlewarePath, REQUIRE_ROLES_TEMPLATE, "utf-8");
-    }
-
-    // 2. Add import to target file
+    // Add import to target file. Whether rbac.ts itself needs to be created
+    // on disk is decided (and only actually written for real runs) by the
+    // caller, so this function is a pure AST transform with no filesystem
+    // side effects — it must not write anything when called during dryRun.
     const relPath = path.relative(path.dirname(filePath), rbacMiddlewarePath).replace(/\.ts$/, "").replace(/\\/g, "/");
     const importPath = relPath.startsWith(".") ? relPath : `./${relPath}`;
 
@@ -207,6 +202,14 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 throw new Error(`Error reading file: ${msg}`);
             }
 
+            // Infer src dir and jail the derived middleware path — a shallow
+            // targetFile must not let dirname(dirname(...)) escape the workspace.
+            const inferredSrcDir = path.dirname(path.dirname(safePath));
+            const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, inferredSrcDir);
+            const middlewareDir = path.join(safeSrcDir, "middleware");
+            const rbacMiddlewarePath = path.join(middlewareDir, "rbac.ts");
+            const rbacMiddlewareExists = fs.existsSync(rbacMiddlewarePath);
+
             let modifiedContent: string;
             let action: string;
 
@@ -216,21 +219,31 @@ export const injectRbacMiddleware: Tool<FastMCPSessionAuth, InjectRbacParams> = 
                 method,
                 routePath,
                 allowedRoles,
-                path.dirname(path.dirname(safePath)) // Infer src dir
+                rbacMiddlewarePath
             ));
 
             if (dryRun) {
                 const sep = "─".repeat(60);
+                const middlewareNote = rbacMiddlewareExists
+                    ? `${rbacMiddlewarePath} already exists — would not be overwritten.`
+                    : `${rbacMiddlewarePath} would be created.`;
                 report.humanMessage =
                     `[INFO] DRY RUN — No file was written.\n` +
                     `File:    ${safePath}\n` +
                     `Route:   ${method.toUpperCase()} ${routePath}\n` +
                     `Roles:   [${allowedRoles.join(", ")} ]\n` +
-                    `Middleware: ${action}\n\n` +
+                    `Middleware: ${action} (${middlewareNote})\n\n` +
                     `${sep}\nPROPOSED FILE CONTENT:\n${sep}\n` +
                     modifiedContent +
                     `\n${sep}`;
                 return;
+            }
+
+            if (!rbacMiddlewareExists) {
+                if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
+                report.snapshotFiles([rbacMiddlewarePath]);
+                fs.writeFileSync(rbacMiddlewarePath, REQUIRE_ROLES_TEMPLATE, "utf-8");
+                report.mutatedFiles.push(rbacMiddlewarePath);
             }
 
             report.snapshotFiles([safePath]);

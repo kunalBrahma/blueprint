@@ -73,9 +73,13 @@ function sanitizeHandlerBody(raw: string): string {
         .replace(/\\'/g, "'")  // unescape \' → '
         .trim();
 
-    // Map common AI-generated auth method names to the exact exports created by injectAuthSystem
-    sanitized = sanitized.replace(/\b(?:await\s+)?login\b/g, (match) => match.includes("await") ? "await signIn" : "signIn");
-    sanitized = sanitized.replace(/\b(?:await\s+)?register\b/g, (match) => match.includes("await") ? "await signUp" : "signUp");
+    // Map common AI-generated auth method names to the exact exports created
+    // by injectAuthSystem. Only rewrite actual function CALLS (name
+    // immediately followed by "(") — matching the bare word anywhere
+    // previously also rewrote object-literal keys and property accesses,
+    // e.g. `res.json({ login: user.login })` corrupted response field names.
+    sanitized = sanitized.replace(/\b(await\s+)?login(\s*)\(/g, (_m, awaitPart, spaceBefore) => `${awaitPart ? "await " : ""}signIn${spaceBefore}(`);
+    sanitized = sanitized.replace(/\b(await\s+)?register(\s*)\(/g, (_m, awaitPart, spaceBefore) => `${awaitPart ? "await " : ""}signUp${spaceBefore}(`);
 
     return sanitized;
 }
@@ -267,9 +271,20 @@ function injectRoute(
         );
 
         if (!hasAuthImport) {
+            // Computed relative to the router file's own directory (matching
+            // the src/routes/*.ts + src/controllers/*.ts convention) instead
+            // of a hardcoded "../controllers/auth.controller" string, which
+            // resolved incorrectly whenever the router file wasn't exactly
+            // one level under a "routes" folder.
+            const routerDir = path.dirname(filePath);
+            const authControllerPath = path.join(path.dirname(routerDir), "controllers", "auth.controller");
+            const relAuthImport = (() => {
+                const rel = path.relative(routerDir, authControllerPath).replace(/\\/g, "/");
+                return rel.startsWith(".") ? rel : `./${rel}`;
+            })();
             sourceFile.addImportDeclaration({
                 namedImports: needed,
-                moduleSpecifier: "../controllers/auth.controller"
+                moduleSpecifier: relAuthImport
             });
         }
     }
@@ -329,16 +344,48 @@ function wireRouteIntoServer(
             serverFile.insertStatements(0, `import ${importName} from "${relImport}";`);
         }
     } else if (existingImport.getModuleSpecifierValue() !== relImport) {
-        // Conflict: same symbol imported from different path; prefer existing alias and warn
-        warnings.push(`[WARNING] '${importName}' is already imported from '${existingImport.getModuleSpecifierValue()}'. Skipping import from '${relImport}'.`);
+        // Conflict: `importName` is already bound to a DIFFERENT module.
+        // Proceeding would silently wire app.use(mountPath, importName) to
+        // that unrelated existing import instead of the new router — hard
+        // fail instead, so the caller picks a different routerImportName.
+        throw new Error(
+            `[AST Hard-Fail] '${importName}' is already imported from '${existingImport.getModuleSpecifierValue()}' in "${serverPath}". ` +
+            `Mounting it as-is would silently bind "${mountPath}" to that unrelated import instead of the new router. ` +
+            `Pass a different "routerImportName" to resolve the conflict.`
+        );
     }
+
+    // Detect the actual Express app variable name instead of hardcoding
+    // "app" — this previously had no existence check at all and would
+    // happily emit a reference to an undefined `app` if the app instance
+    // used a different variable name.
+    const appCandidates: string[] = [];
+    for (const varDecl of serverFile.getVariableDeclarations()) {
+        const init = varDecl.getInitializer();
+        if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
+            appCandidates.push(varDecl.getName());
+        }
+    }
+    if (appCandidates.length === 0) {
+        throw new Error(
+            `[AST Hard-Fail] No Express app declaration (e.g. "const app = express()") found in "${serverPath}". ` +
+            `Cannot determine where to mount "${mountPath}".`
+        );
+    }
+    if (appCandidates.length > 1) {
+        throw new Error(
+            `[AST Hard-Fail] Ambiguous: ${appCandidates.length} Express app declarations found in "${serverPath}": ` +
+            `[${appCandidates.join(", ")}]. Cannot determine which to use.`
+        );
+    }
+    const appVarName = appCandidates[0]!;
 
     // ── Ensure app.use(mountPath, importName) doesn't already exist ──────────
     const stmts = serverFile.getStatements();
     const alreadyMounted = stmts.some((stmt) => {
         if (!Node.isExpressionStatement(stmt)) return false;
         const text = stmt.getText().replace(/\s/g, "");
-        return text.includes(`app.use("${mountPath}"`) || text.includes(`app.use('${mountPath}'`);
+        return text.includes(`${appVarName}.use("${mountPath}"`) || text.includes(`${appVarName}.use('${mountPath}'`);
     });
 
     if (!alreadyMounted) {
@@ -351,14 +398,14 @@ function wireRouteIntoServer(
             const callee = expr.getExpression();
             if (!Node.isPropertyAccessExpression(callee)) return;
             if (
-                callee.getExpression().getText() === "app" &&
+                callee.getExpression().getText() === appVarName &&
                 callee.getName() === "use"
             ) {
                 appUseIndices.push(i);
             }
         });
 
-        const newUse = `app.use("${mountPath}", ${importName});\n`;
+        const newUse = `${appVarName}.use("${mountPath}", ${importName});\n`;
 
         if (appUseIndices.length > 0) {
             const lastUseIdx = appUseIndices[appUseIndices.length - 1]!;

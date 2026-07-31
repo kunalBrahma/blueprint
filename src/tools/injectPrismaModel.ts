@@ -90,6 +90,9 @@ function pad(str: string, width: number): string {
 
 /**
  * Build the @default(...) attribute for an @id field based on its scalar type.
+ * Throws for types with no sensible auto-generated @id default rather than
+ * silently emitting `@default(autoincrement())`, which is invalid Prisma for
+ * anything other than Int/BigInt.
  */
 function idDefault(type: (typeof PRISMA_SCALAR_TYPES)[number]): string {
     switch (type) {
@@ -97,19 +100,38 @@ function idDefault(type: (typeof PRISMA_SCALAR_TYPES)[number]): string {
             return "@default(autoincrement())";
         case "String":
             return "@default(cuid())";
-        default:
-            return "@default(autoincrement())";
+        case "DateTime":
+            return "@default(now())";
+        case "Float":
+        case "Boolean":
+        case "Json":
+            throw new Error(
+                `[Invalid Schema] @id fields of type "${type}" have no sensible auto-generated default. ` +
+                `Provide an explicit "defaultValue" for this field.`
+            );
     }
 }
 
 /**
  * Format an array of field definitions into aligned Prisma model block lines.
+ *
+ * Fields with an explicit `relation` produce TWO lines: the scalar FK column
+ * as given (never carrying @relation itself — Prisma requires that
+ * attribute on an object-typed field, not the scalar FK), plus a second,
+ * object-typed relation field that carries `@relation(fields: [fk], ...)`.
+ * The relation field name is derived by stripping a trailing "Id" from the
+ * FK field name (e.g. "authorId" -> "author"); previously @relation was
+ * incorrectly attached to the scalar field itself, and the FK name was
+ * derived by blindly appending "Id" even when the given name already ended
+ * in "Id" (producing a reference to a nonexistent "authorIdId" field).
  */
 function formatFields(fields: FieldDef[]): string[] {
-    const rows = fields.map((f) => {
-        const nameCol = f.name;
-        const typeStr = f.isOptional ? `${f.type}?` : f.type;
+    type Row = { nameCol: string; typeStr: string; attrStr: string };
+    const rows: Row[] = [];
+    const usedNames = new Set(fields.map((f) => f.name));
 
+    for (const f of fields) {
+        const typeStr = f.isOptional ? `${f.type}?` : f.type;
         const attributes: string[] = [];
         if (f.isId) {
             attributes.push("@id");
@@ -122,14 +144,21 @@ function formatFields(fields: FieldDef[]): string[] {
         if (f.isUnique && !f.isId) {
             attributes.push("@unique");
         }
-        if (f.relation) {
-            // Only emit @relation when the caller EXPLICITLY provided one.
-            const fkField = `${f.name}Id`;
-            attributes.push(`@relation(fields: [${fkField}], references: [id])`);
-        }
 
-        return { nameCol, typeStr, attrStr: attributes.join(" ") };
-    });
+        rows.push({ nameCol: f.name, typeStr, attrStr: attributes.join(" ") });
+
+        if (f.relation) {
+            let relationFieldName = /Id$/.test(f.name) ? f.name.slice(0, -2) : lowerFirst(f.relation);
+            if (!relationFieldName || usedNames.has(relationFieldName)) {
+                relationFieldName = `${relationFieldName || lowerFirst(f.relation)}_rel`;
+            }
+            usedNames.add(relationFieldName);
+
+            const relationTypeStr = f.isOptional ? `${f.relation}?` : f.relation;
+            const relationAttr = `@relation(fields: [${f.name}], references: [id])`;
+            rows.push({ nameCol: relationFieldName, typeStr: relationTypeStr, attrStr: relationAttr });
+        }
+    }
 
     const maxName = Math.max(...rows.map((r) => r.nameCol.length));
     const maxType = Math.max(...rows.map((r) => r.typeStr.length));

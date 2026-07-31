@@ -145,33 +145,49 @@ export async function withMutationReport(
     const envSkip = process.env.SKIP_TSC_VALIDATION === "true" || process.env.NODE_ENV === "test";
     const finalSkip = envSkip || skipValidation || report.skipValidation;
 
-    if (result.status !== "ERROR" && projectPath && !finalSkip) {
-        const root = findProjectRoot(projectPath);
-        if (root && fs.existsSync(path.join(root, "tsconfig.json"))) {
-            try {
-                execSync("npx tsc --noEmit", {
-                    cwd: root,
-                    stdio: "pipe",
-                    timeout: 30000,
-                });
-                result.validation = { passed: true, output: "tsc --noEmit passed" };
-            } catch (err: unknown) {
-                const output =
-                    err instanceof Error && "stdout" in err
-                        ? String((err as any).stdout)
-                        : String(err);
-                result.validation = { passed: false, output: output.slice(0, 2000) };
+    if (result.status !== "ERROR" && projectPath) {
+        if (finalSkip) {
+            // Report honestly that validation did not run, instead of
+            // silently leaving the default { passed: true, output: "" },
+            // which reads identically to "we checked and it passed."
+            result.validation = { passed: true, output: "SKIPPED: tsc validation was explicitly disabled for this operation." };
+        } else {
+            const root = findProjectRoot(projectPath);
+            if (root && fs.existsSync(path.join(root, "tsconfig.json"))) {
+                try {
+                    execSync("npx tsc --noEmit", {
+                        cwd: root,
+                        stdio: "pipe",
+                        timeout: 30000,
+                    });
+                    result.validation = { passed: true, output: "tsc --noEmit passed" };
+                } catch (err: unknown) {
+                    const output =
+                        err instanceof Error && "stdout" in err
+                            ? String((err as any).stdout)
+                            : String(err);
+                    result.validation = { passed: false, output: output.slice(0, 2000) };
 
-                // Atomic rollback: tsc failed → restore all snapshots
-                if (snapshots.size > 0) {
-                    const restored = restoreSnapshots(snapshots);
-                    result.rollback = { triggered: true, restoredFiles: restored };
-                    result.status = "ERROR";
-                    result.humanMessage =
-                        `[ERROR] TypeScript compilation failed after mutation. All changes have been rolled back.\n` +
-                        `[ROLLBACK] ${restored.length} file(s) restored.\n` +
-                        `[TSC OUTPUT] ${output.slice(0, 500)}`;
+                    // Atomic rollback: tsc failed → restore all snapshots
+                    if (snapshots.size > 0) {
+                        const restored = restoreSnapshots(snapshots);
+                        result.rollback = { triggered: true, restoredFiles: restored };
+                        result.status = "ERROR";
+                        result.humanMessage =
+                            `[ERROR] TypeScript compilation failed after mutation. All changes have been rolled back.\n` +
+                            `[ROLLBACK] ${restored.length} file(s) restored.\n` +
+                            `[TSC OUTPUT] ${output.slice(0, 500)}`;
+                    }
                 }
+            } else {
+                // Systemic blind spot: no tsconfig.json found anywhere up the
+                // tree from projectPath, so tsc never ran at all. Previously
+                // this silently left validation.passed at its default `true`,
+                // indistinguishable from an actual passing validation run.
+                result.validation = {
+                    passed: true,
+                    output: `SKIPPED: no tsconfig.json found starting from "${projectPath}" — mutation was NOT type-checked.`,
+                };
             }
         }
     }

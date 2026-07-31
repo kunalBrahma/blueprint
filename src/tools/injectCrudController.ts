@@ -74,7 +74,7 @@ function getModelFields(targetDir: string, modelName: string): { hasCreatedAt: b
   return { hasCreatedAt, hasUpdatedAt, fields };
 }
 
-function generateZodSchema(fields: ModelField[], modelName: string) {
+function generateZodSchema(fields: ModelField[], modelName: string, storageField?: string) {
   let createSchema = `export const Create${modelName}Schema = z.object({\n`;
   let updateSchema = `export const Update${modelName}Schema = z.object({\n`;
 
@@ -90,7 +90,9 @@ function generateZodSchema(fields: ModelField[], modelName: string) {
 
     updateSchema += `  ${f.name}: ${zodType}.optional(),\n`;
 
-    if (f.isOptional) {
+    // storageField (e.g. imageUrl) is populated from req.file, not the JSON
+    // body, so it must be optional on create even if Prisma requires it.
+    if (f.isOptional || f.name === storageField) {
       createSchema += `  ${f.name}: ${zodType}.optional(),\n`;
     } else {
       createSchema += `  ${f.name}: ${zodType},\n`;
@@ -140,7 +142,7 @@ function buildCrudController(modelName: string, hasStorage: boolean, targetDir: 
     });
   }
 
-  const { createSchema, updateSchema } = generateZodSchema(fields, modelName);
+  const { createSchema, updateSchema } = generateZodSchema(fields, modelName, useStorage ? "imageUrl" : undefined);
   sourceFile.addStatements(`\n${createSchema}\n${updateSchema}\n`);
 
   sourceFile.addStatements(`
@@ -310,7 +312,7 @@ ${searchClause}
   if (useStorage) {
     updateBody += `
     if (req.file) {
-      data.imageUrl = await storageService.uploadFile(req.file);
+      parsed.imageUrl = await storageService.uploadFile(req.file);
     }
 `;
   }

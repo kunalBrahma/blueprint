@@ -15,6 +15,7 @@ const injectTransactionSchema = z.object({
         .describe("Absolute path to the Express controller file"),
     functionName: z
         .string()
+        .regex(/^[A-Za-z_$][A-Za-z0-9_$]*$/, "functionName must be a valid JS identifier")
         .describe("The name of the exported function to create or wrap (e.g., 'checkout', 'processOrder')"),
     transactionLogic: z
         .string()
@@ -217,6 +218,30 @@ function ensureExpressAndPrismaImports(
     }
 }
 
+// Unlike `paymentService` (which this tool auto-scaffolds a minimal stub for
+// below), socket/mail/sms services are the responsibility of their own
+// dedicated tools (inject_socket_service, inject_mail_provider). Rather than
+// blindly emitting an import to a module that may not exist — which only
+// fails later, deep inside a tsc rollback — check up front and fail fast
+// with an actionable message.
+function findMissingServiceDeps(
+    fullLogic: string,
+    safeServicesDir: string,
+    safeUtilsDir: string
+): string[] {
+    const missing: string[] = [];
+    if (fullLogic.includes("socketService") && !fs.existsSync(path.join(safeServicesDir, "socket.service.ts"))) {
+        missing.push(`"socketService" is used but ${path.join(safeServicesDir, "socket.service.ts")} was not found. Run inject_socket_service first.`);
+    }
+    if (fullLogic.includes("mailService") && !fs.existsSync(path.join(safeServicesDir, "mail.service.ts"))) {
+        missing.push(`"mailService" is used but ${path.join(safeServicesDir, "mail.service.ts")} was not found. Run inject_mail_provider first.`);
+    }
+    if (fullLogic.includes("smsService") && !fs.existsSync(path.join(safeUtilsDir, "sms.ts"))) {
+        missing.push(`"smsService" is used but ${path.join(safeUtilsDir, "sms.ts")} was not found. Create it first, or remove the smsService usage.`);
+    }
+    return missing;
+}
+
 function hasFunction(
     sourceFile: ReturnType<InstanceType<typeof Project>["createSourceFile"]>,
     functionName: string
@@ -292,6 +317,14 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
 
             // FIX: Pass the combined logic and callback string so AST can find socketService
             const fullLogicString = transactionLogic + (callbackAction ? `\n${callbackAction}` : "");
+
+            const safeServicesDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(path.dirname(safePath), "../services"));
+            const safeUtilsDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(path.dirname(safePath), "../utils"));
+            const missingDeps = findMissingServiceDeps(fullLogicString, safeServicesDir, safeUtilsDir);
+            if (missingDeps.length > 0) {
+                throw new Error(`[Missing Dependencies]\n${missingDeps.map((m) => `  - ${m}`).join("\n")}`);
+            }
+
             ensureDynamicImports(sourceFile, fullLogicString, warnings);
 
             // ── 5. Inject the Transaction Function ─────────────────────────────────
@@ -320,9 +353,8 @@ export const injectTransaction: Tool<FastMCPSessionAuth, InjectTransactionParams
             // Check for payment service helper
             let servicePath: string | undefined;
             if (fullLogicString.includes("paymentService")) {
-                const servicesDir = path.resolve(path.dirname(safePath), "../services");
-                if (!fs.existsSync(servicesDir)) fs.mkdirSync(servicesDir, { recursive: true });
-                servicePath = path.join(servicesDir, "payment.service.ts");
+                if (!fs.existsSync(safeServicesDir)) fs.mkdirSync(safeServicesDir, { recursive: true });
+                servicePath = path.join(safeServicesDir, "payment.service.ts");
             }
 
             if (servicePath && !fs.existsSync(servicePath)) {

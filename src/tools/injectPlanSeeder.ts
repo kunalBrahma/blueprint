@@ -96,11 +96,13 @@ export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
         return;
       }
 
+      let scriptWritten = false;
       if (!fs.existsSync(scriptPath)) {
         report.snapshotFiles([scriptPath]);
 
         fs.writeFileSync(scriptPath, content, "utf-8");
         report.mutatedFiles.push(scriptPath);
+        scriptWritten = true;
       }
 
       const pkgPath = path.resolve(safeSrcDir, "..", "package.json");
@@ -117,7 +119,12 @@ export const injectPlanSeeder: Tool<FastMCPSessionAuth, InjectSeederParams> = {
         }
       }
 
-      report.humanMessage = `[SUCCESS] Plan Seeder auto-injected. Added "npm run seed:plans" to package.json.\nFile: ${scriptPath}`;
+      // Reflect whether the seeder script was actually (re)generated —
+      // previously this always reported unconditional [SUCCESS], masking
+      // the fact that an existing seedPlans.ts was silently left untouched.
+      report.humanMessage = scriptWritten
+        ? `[SUCCESS] Plan Seeder auto-injected. Added "npm run seed:plans" to package.json.\nFile: ${scriptPath}`
+        : `[INFO] ${scriptPath} already exists — left unchanged. Ensured "npm run seed:plans" is set in package.json.`;
     });
   },
 };

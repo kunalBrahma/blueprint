@@ -85,7 +85,12 @@ export const injectEnvValidation: Tool<FastMCPSessionAuth, InjectEnvParams> = {
             const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetSrcDirectory));
             const configDir = path.resolve(safeSrcDir, "config");
             const filePath = path.join(configDir, "env.ts");
-            const envFilePath = path.join(projectRoot, ".env");
+            // Derived and re-jailed from the already-validated safeSrcDir (not
+            // the raw, unjailed targetSrcDirectory) — if targetSrcDirectory
+            // is WORKSPACE_ROOT itself (no nested "src"), this correctly
+            // throws instead of silently writing .env one directory above
+            // the workspace root.
+            const envFilePath = enforcePathJail(WORKSPACE_ROOT, path.resolve(safeSrcDir, "..", ".env"));
 
             if (!fs.existsSync(configDir)) {
                 fs.mkdirSync(configDir, { recursive: true });

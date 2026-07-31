@@ -22,11 +22,34 @@ function buildSeedCode(schemaPath: string): string {
   const schemaContent = fs.existsSync(schemaPath) ? fs.readFileSync(schemaPath, "utf-8") : "";
   const hasRoleEnum = schemaContent.includes("enum Role");
   const hasAdminRole = schemaContent.match(/enum\s+Role\s*\{[^}]*ADMIN[^}]*\}/s);
-  
-  const roleField = hasRoleEnum 
+  // Only seed dummy products if the target schema actually has a Product
+  // model — previously this was emitted unconditionally, guaranteeing a tsc
+  // failure/rollback for any schema without that exact model name.
+  const hasProductModel = /model\s+Product\s*\{/.test(schemaContent);
+
+  const roleField = hasRoleEnum
     ? (hasAdminRole ? "        role: Role.ADMIN," : "        // role: Role.ADMIN, // (ADMIN not found in Role enum)")
     : "";
   const roleImport = hasRoleEnum ? 'import { PrismaClient, Role } from "@prisma/client";' : 'import { PrismaClient } from "@prisma/client";';
+
+  const productSeedBlock = hasProductModel ? `
+  const products = [
+    { name: "Premium Widget", description: "A high-quality widget", price: 99.99, stock: 50 },
+    { name: "Basic Gadget", description: "An essential gadget for everyday use", price: 29.99, stock: 200 },
+    { name: "Luxury Gizmo", description: "The ultimate gizmo", price: 499.00, stock: 10 }
+  ];
+
+  for (const p of products) {
+    const existing = await prisma.product.findFirst({ where: { name: p.name } });
+    if (!existing) {
+      // Use unknown cast to satisfy Prisma's specific input types for products
+      await prisma.product.create({ data: p as unknown as any });
+      console.log(\`[SUCCESS] Product created: \${p.name}\`);
+    }
+  }
+` : `
+  // No "Product" model found in schema.prisma — skipping dummy product seeding.
+`;
 
   sourceFile.addStatements(`
 ${roleImport}
@@ -55,21 +78,7 @@ ${roleField}
     console.log("[INFO] Admin user already exists");
   }
 
-  const products = [
-    { name: "Premium Widget", description: "A high-quality widget", price: 99.99, stock: 50 },
-    { name: "Basic Gadget", description: "An essential gadget for everyday use", price: 29.99, stock: 200 },
-    { name: "Luxury Gizmo", description: "The ultimate gizmo", price: 499.00, stock: 10 }
-  ];
-
-  for (const p of products) {
-    const existing = await prisma.product.findFirst({ where: { name: p.name } });
-    if (!existing) {
-      // Use unknown cast to satisfy Prisma's specific input types for products
-      await prisma.product.create({ data: p as unknown as any });
-      console.log(\`[SUCCESS] Product created: \${p.name}\`);
-    }
-  }
-
+${productSeedBlock}
   console.log("Seeding finished.");
 }
 
@@ -116,13 +125,13 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
 
     return withMutationReport("inject_prisma_seed", dryRun ? null : projectRoot, async (report) => {
       const safePath = enforcePathJail(WORKSPACE_ROOT, resolvedPath);
-      if (!fs.existsSync(resolvedPath)) {
-        throw new Error(`Prisma directory not found: "${resolvedPath}"`);
+      if (!fs.existsSync(safePath)) {
+        throw new Error(`Prisma directory not found: "${safePath}"`);
       }
 
-      const seedPath = path.join(resolvedPath, "seed.ts");
-      const packageJsonPath = path.join(resolvedPath, "../package.json");
-      const schemaPath = path.join(resolvedPath, "schema.prisma");
+      const seedPath = path.join(safePath, "seed.ts");
+      const packageJsonPath = path.join(safePath, "../package.json");
+      const schemaPath = path.join(safePath, "schema.prisma");
 
       if (fs.existsSync(seedPath)) {
         throw new Error(`Guard: File already exists: "${seedPath}"`);
@@ -154,6 +163,7 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
       fs.writeFileSync(seedPath, seedCode, "utf-8");
       report.mutatedFiles.push(seedPath);
 
+      let packageJsonWarning = "";
       if (fs.existsSync(packageJsonPath)) {
         try {
           const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
@@ -162,10 +172,14 @@ export const injectPrismaSeed: Tool<FastMCPSessionAuth, InjectSeedParams> = {
           report.snapshotFiles([packageJsonPath]);
           fs.writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2), "utf-8");
           report.mutatedFiles.push(packageJsonPath);
-        } catch (e) { }
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          packageJsonWarning = `\n\n[WARNING] Failed to update package.json's "prisma.seed" field: ${msg}\nAdd it manually: "prisma": { "seed": "ts-node prisma/seed.ts" }`;
+          report.status = "PARTIAL_FAILURE";
+        }
       }
 
-      report.humanMessage = `[SUCCESS] Prisma seed.ts generated successfully!\n\nTo run it: npx prisma db seed${packageWarnings}`;
+      report.humanMessage = `[SUCCESS] Prisma seed.ts generated successfully!\n\nTo run it: npx prisma db seed${packageWarnings}${packageJsonWarning}`;
     });
   },
 };

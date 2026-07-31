@@ -10,7 +10,11 @@ import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const injectAuthSchema = z.object({
   targetDirectory: z.string().describe("Absolute path to the controllers folder"),
-  authProviders: z.enum(["email", "google"]).array().describe("Providers to implement"),
+  // Only "email" actually generates working code. A "google" option used to
+  // exist here but only added a dead `googleId` schema field and installed
+  // passport-google-oauth20 with zero route/callback generation — a
+  // misleading no-op. Removed rather than left half-implemented.
+  authProviders: z.enum(["email"]).array().min(1).describe("Providers to implement (email/password only)"),
   serverFile: z.string().describe("Absolute path to server.ts for route mounting"),
   dryRun: z.boolean().default(false),
   force: z.boolean().default(false).describe("Overwrite existing auth files if they exist"),
@@ -34,7 +38,7 @@ function getTscErrorCount(cwd: string): number {
 
 // ─── 2. Idempotent Schema Mutation ───────────────────────────────────────────
 
-function mutateSchemaSafely(projectRoot: string, providers: string[]): string[] {
+function mutateSchemaSafely(projectRoot: string): string[] {
   const schemaPath = path.join(projectRoot, "prisma/schema.prisma");
   if (!fs.existsSync(schemaPath)) return ["[WARNING] schema.prisma not found. Schema injection skipped."];
 
@@ -46,11 +50,13 @@ function mutateSchemaSafely(projectRoot: string, providers: string[]): string[] 
     const lines = schema.split("\n");
     let inUser = false;
     let braceDepth = 0;
+    let userBlockStart = -1;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i] as string;
       if (!inUser && line.match(/^model\s+User\s*\{/)) {
         inUser = true;
+        userBlockStart = i;
       }
       if (inUser) {
         braceDepth += (line.match(/\{/g) || []).length;
@@ -63,12 +69,12 @@ function mutateSchemaSafely(projectRoot: string, providers: string[]): string[] 
             { name: "resetTokens", line: "  resetTokens         PasswordResetToken[]" }
           ];
 
-          if (providers.includes("google")) {
-            fieldConfigs.push({ name: "googleId", line: "  googleId            String?  @unique" });
-          }
-
-          // Idempotent insertion: only add fields that don't exist
-          const modelBlock = lines.slice(0, i + 1).join("\n");
+          // Idempotent insertion: only add fields that don't exist.
+          // Scoped to just the User model block (userBlockStart..i), not the
+          // whole file from the top — a field name matching anywhere earlier
+          // in the file (a comment, another model) previously caused a
+          // legitimate field to be silently skipped.
+          const modelBlock = lines.slice(userBlockStart, i + 1).join("\n");
           const fieldsToAdd = fieldConfigs
             .filter(f => !modelBlock.includes(f.name))
             .map(f => f.line)
@@ -215,7 +221,7 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
   parameters: injectAuthSchema,
 
   execute: async (args) => {
-    const { targetDirectory, authProviders, serverFile, dryRun, force } = args;
+    const { targetDirectory, serverFile, dryRun, force } = args;
 
     const safeControllersDir = enforcePathJail(WORKSPACE_ROOT, path.resolve(targetDirectory));
     const safeServerFile = enforcePathJail(WORKSPACE_ROOT, path.resolve(serverFile));
@@ -251,12 +257,17 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
       // 2. Baseline TSC Check (Before any mutations)
       const baselineErrors = getTscErrorCount(projectRoot);
 
-      // Snapshot files to allow rollback
+      // Snapshot files to allow rollback. Includes the 3 new auth files
+      // (captured as null/non-existent when force=false, since the guard
+      // above already ensures they don't exist yet) so a later failure
+      // (AST wiring, npm install, TSC Fail) rolls back atomically instead
+      // of leaving them orphaned on disk while the report claims full
+      // rollback.
       const schemaPath = path.join(projectRoot, "prisma/schema.prisma");
-      report.snapshotFiles([schemaPath, safeServerFile]);
+      report.snapshotFiles([schemaPath, safeServerFile, ...Object.values(paths)]);
 
       // 3. Schema Mutation
-      const statusWarnings = mutateSchemaSafely(projectRoot, authProviders);
+      const statusWarnings = mutateSchemaSafely(projectRoot);
 
       // 4. Ensure Directories Exist
       Object.values(paths).forEach(p => {
@@ -273,14 +284,33 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
       const project = new Project();
       const serverSource = project.addSourceFileAtPath(safeServerFile);
 
-      if (!serverSource.getText().includes("app.use") && !serverSource.getText().includes("express()")) {
-        throw new Error("[AST Hard-Fail] Express app instance not detected in server.ts.");
+      // Detect the actual Express app variable name instead of assuming
+      // "app" — a substring guard on the literal text "app.use"/"express()"
+      // previously let `const server = express();` slip through and emit a
+      // reference to an undefined `app` variable.
+      const appCandidates: string[] = [];
+      for (const varDecl of serverSource.getVariableDeclarations()) {
+        const init = varDecl.getInitializer();
+        if (init && (init.getText().includes("express()") || init.getText().startsWith("express()"))) {
+          appCandidates.push(varDecl.getName());
+        }
       }
+      if (appCandidates.length === 0) {
+        throw new Error(`[AST Hard-Fail] No Express app declaration (e.g. "const app = express()") found in "${safeServerFile}". Cannot determine where to mount the auth routes.`);
+      }
+      if (appCandidates.length > 1) {
+        throw new Error(`[AST Hard-Fail] Ambiguous: ${appCandidates.length} Express app declarations found in "${safeServerFile}": [${appCandidates.join(", ")}]. Cannot determine which to use.`);
+      }
+      const appVarName = appCandidates[0]!;
 
       const stmts = serverSource.getStatements();
       const lastAppUseIdx = stmts.reduce((last, stmt, idx) => {
-        const text = stmt.getText();
-        if (Node.isExpressionStatement(stmt) && text.includes("app.use")) {
+        if (!Node.isExpressionStatement(stmt)) return last;
+        const expr = stmt.getExpression();
+        if (!Node.isCallExpression(expr)) return last;
+        const callee = expr.getExpression();
+        if (Node.isPropertyAccessExpression(callee) && callee.getExpression().getText() === appVarName && callee.getName() === "use") {
+          const text = stmt.getText();
           // Avoid inserting after error handlers
           if (!text.includes("err,") && !text.includes("next")) return idx;
         }
@@ -290,9 +320,9 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
       if (!serverSource.getImportDeclaration(i => i.getModuleSpecifierValue().includes("auth.routes"))) {
         serverSource.addImportDeclaration({ defaultImport: "authRoutes", moduleSpecifier: "./routes/auth.routes" });
         if (lastAppUseIdx !== -1) {
-          serverSource.insertStatements(lastAppUseIdx + 1, `app.use("/api/auth", authRoutes);`);
+          serverSource.insertStatements(lastAppUseIdx + 1, `${appVarName}.use("/api/auth", authRoutes);`);
         } else {
-          serverSource.addStatements(`app.use("/api/auth", authRoutes);`);
+          serverSource.addStatements(`${appVarName}.use("/api/auth", authRoutes);`);
         }
       }
       // This is a synchronous blocking save
@@ -300,9 +330,6 @@ export const injectAuthSystem: Tool<FastMCPSessionAuth, InjectAuthParams> = {
 
       // 7. FIX: Execute NPM Install BEFORE final validation
       const pkgs = ["bcrypt", "jsonwebtoken", "zod", "@types/bcrypt", "@types/jsonwebtoken"];
-      if (authProviders.includes("google")) {
-        pkgs.push("passport", "passport-google-oauth20", "@types/passport", "@types/passport-google-oauth20");
-      }
 
       try {
         execSync(`npm install ${pkgs.join(" ")} --save-exact`, { cwd: projectRoot, stdio: "pipe" });

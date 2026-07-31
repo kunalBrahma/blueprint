@@ -31,12 +31,15 @@ export default defineConfig({
 
 function buildAuthTest(appFileName: string): string {
   const appName = appFileName.replace(/\.(ts|js)$/, "");
+  // Header/imports only — the caller appends exactly one balanced
+  // `describe(...) { ... }` block on top of this. Previously this function
+  // also opened its own (never-closed) describe block, which the caller then
+  // appended a second, fully-closed describe block on top of — producing an
+  // unbalanced brace in the generated file on every single invocation.
   return `
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import request from "supertest";
-import app from "../${appName}"; 
-
-describe("Auth Endpoints", () => {
+import app from "../${appName}";
 `.trimStart();
 }
 

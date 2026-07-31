@@ -146,7 +146,15 @@ function injectIntoServer(serverContent: string, serverPath: string, srcPath: st
     });
 
     const useStmt = `\n// Global Error Handler must be the last middleware\n${appVarName}.use(globalErrorHandler);\n`;
-    const alreadyMounted = stmts.some(stmt => stmt.getText().includes("globalErrorHandler"));
+    // Must check for the actual mount call, not just any statement whose text
+    // contains "globalErrorHandler" — `stmts` was captured after the import
+    // declaration was inserted above, and that import's own text also
+    // contains the substring, which previously made this always true on the
+    // very first run and silently prevented the middleware from ever being
+    // mounted.
+    const alreadyMounted = stmts.some(
+        (stmt) => Node.isExpressionStatement(stmt) && /\.use\(\s*globalErrorHandler\s*\)/.test(stmt.getText())
+    );
 
     if (!alreadyMounted) {
         if (listenIndex !== -1) {
@@ -172,23 +180,25 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
         const { serverFile, targetSrcDirectory, dryRun } = args;
         const resolvedServerPath = path.resolve(serverFile);
         const resolvedSrcDir = path.resolve(targetSrcDirectory);
-        const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
         const projectRoot = path.resolve(resolvedSrcDir, "..");
 
         return withMutationReport("inject_global_error_handler", dryRun ? null : projectRoot, async (report) => {
-            if (!fs.existsSync(resolvedServerPath)) throw new Error(`serverFile not found: "${resolvedServerPath}"`);
-            if (!fs.existsSync(resolvedSrcDir)) throw new Error(`src directory not found: "${resolvedSrcDir}"`);
+            const safeServerPath = enforcePathJail(WORKSPACE_ROOT, resolvedServerPath);
+            const safeSrcDir = enforcePathJail(WORKSPACE_ROOT, resolvedSrcDir);
 
-            const utilsDir = path.join(resolvedSrcDir, "utils");
-            const middlewareDir = path.join(resolvedSrcDir, "middleware");
+            if (!fs.existsSync(safeServerPath)) throw new Error(`serverFile not found: "${safeServerPath}"`);
+            if (!fs.existsSync(safeSrcDir)) throw new Error(`src directory not found: "${safeSrcDir}"`);
+
+            const utilsDir = path.join(safeSrcDir, "utils");
+            const middlewareDir = path.join(safeSrcDir, "middleware");
             const appErrorPath = path.join(utilsDir, "AppError.ts");
             const errHandlerPath = path.join(middlewareDir, "errorHandler.ts");
 
             if (fs.existsSync(appErrorPath)) throw new Error(`Guard: File exists: "${appErrorPath}"`);
             if (fs.existsSync(errHandlerPath)) throw new Error(`Guard: File exists: "${errHandlerPath}"`);
 
-            const serverContent = fs.readFileSync(resolvedServerPath, "utf-8");
-            const modifiedServer = injectIntoServer(serverContent, resolvedServerPath, resolvedSrcDir);
+            const serverContent = fs.readFileSync(safeServerPath, "utf-8");
+            const modifiedServer = injectIntoServer(serverContent, safeServerPath, safeSrcDir);
             const appErrorContent = buildAppError();
             const errHandlerContent = buildErrorHandler();
 
@@ -204,17 +214,17 @@ export const injectGlobalErrorHandler: Tool<FastMCPSessionAuth, InjectGlobalErro
             if (!fs.existsSync(utilsDir)) fs.mkdirSync(utilsDir, { recursive: true });
             if (!fs.existsSync(middlewareDir)) fs.mkdirSync(middlewareDir, { recursive: true });
 
-            report.snapshotFiles([appErrorPath, errHandlerPath, resolvedServerPath]);
+            report.snapshotFiles([appErrorPath, errHandlerPath, safeServerPath]);
 
 
             fs.writeFileSync(appErrorPath, appErrorContent, "utf-8");
             report.mutatedFiles.push(appErrorPath);
             fs.writeFileSync(errHandlerPath, errHandlerContent, "utf-8");
             report.mutatedFiles.push(errHandlerPath);
-            fs.writeFileSync(resolvedServerPath, modifiedServer, "utf-8");
-            report.mutatedFiles.push(resolvedServerPath);
+            fs.writeFileSync(safeServerPath, modifiedServer, "utf-8");
+            report.mutatedFiles.push(safeServerPath);
 
-            report.humanMessage = `[SUCCESS] Global Error Handler injected successfully!\nFiles Created:\n  - ${appErrorPath}\n  - ${errHandlerPath}\nServer Updated:\n  - ${resolvedServerPath}`;
+            report.humanMessage = `[SUCCESS] Global Error Handler injected successfully!\nFiles Created:\n  - ${appErrorPath}\n  - ${errHandlerPath}\nServer Updated:\n  - ${safeServerPath}`;
         });
     },
 };

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { z } from "zod";
-import { Project, Node } from "ts-morph";
+import { Project, Node, SyntaxKind } from "ts-morph";
 import type { FastMCPSessionAuth, Tool } from "fastmcp";
 import { withMutationReport } from "../utils/mutationTracker.js";
 import { enforcePathJail } from "../utils/pathJail.js";
@@ -66,7 +66,50 @@ function updateAuthController(targetSrcDirectory: string, report: { mutatedFiles
     const sourceFile = project.createSourceFile(authControllerPath, fs.readFileSync(authControllerPath, "utf-8"), { overwrite: true });
 
     const forgotPasswordFn = sourceFile.getFunction("forgotPassword");
-    if (!forgotPasswordFn) return "[WARNING] forgotPassword function not found in auth.controller.ts.";
+    if (!forgotPasswordFn) return "[WARNING] forgotPassword function not found in auth.controller.ts. No changes made — wire up mailService.sendEmail() manually.";
+
+    // The replacement statement hardcodes `email`/`resetToken` and an
+    // unconditional `await` — verify both identifiers are actually in scope
+    // and the function is `async` before emitting code that references them,
+    // instead of assuming a specific implementation shape.
+    if (!forgotPasswordFn.isAsync()) {
+        return "[WARNING] forgotPassword is not declared `async` — skipping AST injection to avoid emitting an invalid `await`. Wire up mailService.sendEmail() manually.";
+    }
+    const paramNames = new Set(forgotPasswordFn.getParameters().map((p) => p.getName()));
+    const localVarNames = new Set(
+        forgotPasswordFn.getDescendantsOfKind(SyntaxKind.VariableDeclaration).map((v) => v.getName())
+    );
+    const inScope = (name: string) => paramNames.has(name) || localVarNames.has(name);
+    if (!inScope("email") || !inScope("resetToken")) {
+        return "[WARNING] Could not find `email`/`resetToken` identifiers in scope inside forgotPassword — skipping AST injection to avoid referencing undefined variables. Wire up mailService.sendEmail() manually.";
+    }
+
+    // Scan ALL expression statements within the function (including ones
+    // nested inside try/catch/if blocks), not just top-level statements —
+    // the console.log placeholder this looks for very plausibly lives inside
+    // a try block.
+    let replaced = false;
+    for (const stmt of forgotPasswordFn.getDescendantsOfKind(SyntaxKind.ExpressionStatement)) {
+        const expr = stmt.getExpression();
+        if (Node.isCallExpression(expr)) {
+            const callee = expr.getExpression();
+            if (Node.isPropertyAccessExpression(callee) && callee.getText() === "console.log" && expr.getText().includes("`Sending password reset email to")) {
+                stmt.replaceWithText(`
+    await mailService.sendEmail({
+      to: email,
+      subject: "Password Reset Details",
+      html: \`<p>You requested a password reset. Here is your token: <strong>\${resetToken}</strong></p>\`
+    });
+`.trim());
+                replaced = true;
+                break;
+            }
+        }
+    }
+
+    if (!replaced) {
+        return "[WARNING] Could not find the expected console.log placeholder in forgotPassword — no changes made. Wire up mailService.sendEmail() manually.";
+    }
 
     const hasMailImport = sourceFile.getImportDeclarations().some(imp => imp.getModuleSpecifierValue() === "../services/mail.service");
     if (!hasMailImport) {
@@ -74,25 +117,6 @@ function updateAuthController(targetSrcDirectory: string, report: { mutatedFiles
             namedImports: ["mailService"],
             moduleSpecifier: "../services/mail.service",
         });
-    }
-
-    for (const stmt of forgotPasswordFn.getStatements()) {
-        if (Node.isExpressionStatement(stmt)) {
-            const expr = stmt.getExpression();
-            if (Node.isCallExpression(expr)) {
-                const callee = expr.getExpression();
-                if (Node.isPropertyAccessExpression(callee) && callee.getText() === "console.log" && expr.getText().includes("`Sending password reset email to")) {
-                    stmt.replaceWithText(`
-    await mailService.sendEmail({
-      to: email,
-      subject: "Password Reset Details",
-      html: \`<p>You requested a password reset. Here is your token: <strong>\${resetToken}</strong></p>\`
-    });
-`.trim());
-                    break;
-                }
-            }
-        }
     }
 
     sourceFile.fixUnusedIdentifiers();

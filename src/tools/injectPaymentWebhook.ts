@@ -107,7 +107,14 @@ async function handleRazorpayEvent(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  if (expectedSignature !== signature) {
+  const providedSignature = Array.isArray(signature) ? signature[0] : signature;
+  const expectedBuffer = Buffer.from(expectedSignature, "hex");
+  const providedBuffer = Buffer.from(String(providedSignature ?? ""), "hex");
+  const signatureValid =
+    expectedBuffer.length === providedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+
+  if (!signatureValid) {
     res.status(400).send("Invalid signature");
     return;
   }
@@ -198,9 +205,11 @@ import { env } from "../config/env";
 
 const router = Router();
 
+// "/:provider" already matches "/stripe" and "/razorpay" (paymentWebhook
+// reads req.params.provider), so no separate explicit routes are needed —
+// those would never be reached since this route is registered first and
+// doesn't call next().
 router.post(["/", "/:provider"], express.raw({ type: "application/json" }), paymentWebhook);
-router.post("/stripe", express.raw({ type: "application/json" }), paymentWebhook);
-router.post("/razorpay", express.raw({ type: "application/json" }), paymentWebhook);
 
 export default router;
 `.trimStart());
@@ -236,6 +245,7 @@ export const injectPaymentWebhook: Tool<FastMCPSessionAuth, InjectPaymentWebhook
       const routePath = path.join(routesDir, "webhook.routes.ts");
 
       if (fs.existsSync(controllerPath)) throw new Error(`Guard: ${controllerPath} already exists.`);
+      if (fs.existsSync(routePath)) throw new Error(`Guard: ${routePath} already exists.`);
 
       const controllerCode = buildWebhookController();
       const routeCode = buildWebhookRoute();

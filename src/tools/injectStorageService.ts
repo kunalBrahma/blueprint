@@ -39,7 +39,13 @@ const storage = useMemoryStorage
   ? multer.memoryStorage()
   : multer.diskStorage({
       destination: (req, file, cb) => {
-        cb(null, path.join(__dirname, "../../public/uploads/"));
+        // Resolved from process.cwd() (the project root the server is
+        // launched from), not __dirname — a __dirname-relative traversal
+        // depends on this compiled file sitting at exactly the same
+        // directory depth as it does in src/, which isn't guaranteed across
+        // different tsconfig outDir/rootDir setups or when running directly
+        // via tsx/ts-node instead of a dist/ build.
+        cb(null, path.join(process.cwd(), "public/uploads/"));
       },
       filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
@@ -155,7 +161,7 @@ export class StorageService implements IStorageService {
          return true;
       } else {
          const filename = path.basename(key);
-         const filePath = path.join(__dirname, "../../public/uploads/", filename);
+         const filePath = path.join(process.cwd(), "public/uploads/", filename);
          if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
             return true;
