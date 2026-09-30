@@ -10,9 +10,16 @@ import { WORKSPACE_ROOT } from "../utils/workspace.js";
 
 const execFileAsync = util.promisify(execFile);
 
+const BOILERPLATE_REPO = "https://github.com/kunalBrahma/backend-boilerplate.git";
+const PLACEHOLDER_DATABASE_URL = "postgresql://placeholder:placeholder@localhost:5432/placeholder";
+
 // A valid git ref/branch name: no shell metacharacters, no leading "-" (which
 // would otherwise be interpreted as a CLI flag by git), no ".." segments.
 const GIT_REF_PATTERN = /^(?!-)(?!.*\.\.)[a-zA-Z0-9._/-]+$/;
+
+// Standalone apps shipped in the boilerplate monorepo, one top-level folder each.
+const APPS = ["backend", "frontend", "admin"] as const;
+type App = (typeof APPS)[number];
 
 // 1. Zod Schema
 const scaffoldProjectSchema = z.object({
@@ -20,15 +27,24 @@ const scaffoldProjectSchema = z.object({
     outputDir: z
         .string()
         .describe("The absolute path to the directory where the project should be created"),
+    apps: z
+        .array(z.enum(APPS))
+        .min(1, "apps must include at least one of: backend, frontend, admin")
+        .default(["backend"])
+        .describe(
+            "Which boilerplate apps to include: 'backend' (Express + Prisma API), 'frontend' (Next.js public app), " +
+            "'admin' (Next.js admin dashboard). Defaults to backend only; pass all three for the full stack. " +
+            "Each app lands in its own sub-folder (e.g. <project>/backend)."
+        ),
     branch: z
         .string()
         .regex(GIT_REF_PATTERN, "branch must be a valid git ref (letters, digits, '.', '_', '-', '/', no leading '-', no '..')")
-        .default("v1.0.0")
-        .describe("The branch to clone from the boilerplate repository"),
+        .default("main")
+        .describe("The branch or tag to clone from the boilerplate repository"),
     installDeps: z
         .boolean()
         .default(true)
-        .describe("Whether to install npm dependencies after cloning"),
+        .describe("Whether to install npm dependencies for each selected app after cloning"),
 });
 
 type ScaffoldParams = typeof scaffoldProjectSchema;
@@ -36,10 +52,13 @@ type ScaffoldParams = typeof scaffoldProjectSchema;
 // 2. Tool Execution (Cloning your Boilerplate)
 export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
     name: "scaffold_project",
-    description: "Instantly clones Kunal's standard backend-boilerplate into a new directory, removes git history, and prepares it for development.",
+    description:
+        "Instantly clones Kunal's boilerplate into a new directory, removes git history, and prepares it for development. " +
+        "Choose which apps to include via `apps`: backend only (default), or any mix of backend, frontend and admin for the full stack.",
     parameters: scaffoldProjectSchema,
     execute: async (args) => {
         const { projectName, outputDir, installDeps, branch } = args;
+        const apps = [...new Set(args.apps)] as App[];
         const absoluteOutputDir = path.resolve(WORKSPACE_ROOT, outputDir);
 
         // The actual clone target is a sub-directory named after the project.
@@ -51,6 +70,11 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
         );
 
         return withMutationReport("scaffold_project", projectRoot, async (report) => {
+            // Each app is type-checked below in its own folder. The wrapper's
+            // generic tsc pass would start from the monorepo root, which has no
+            // package.json/tsconfig and could resolve to an unrelated parent project.
+            report.skipValidation = true;
+
             // Guard: only the specific target sub-dir must be empty or absent
             if (fs.existsSync(projectRoot) && fs.readdirSync(projectRoot).length > 0) {
                 throw new Error(
@@ -75,8 +99,8 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
                 // against GIT_REF_PATTERN by the zod schema above (defense in depth).
                 await execFileAsync(
                     "git",
-                    ["clone", "--branch", branch, "--depth", "1", "https://github.com/kunalBrahma/backend-boilerplate.git", "."],
-                    { cwd: projectRoot, timeout: 30000 }
+                    ["clone", "--branch", branch, "--depth", "1", BOILERPLATE_REPO, "."],
+                    { cwd: projectRoot, timeout: 60000 }
                 );
 
                 // Step 3: Remove the original .git history
@@ -85,42 +109,114 @@ export const scaffoldProject: Tool<FastMCPSessionAuth, ScaffoldParams> = {
                     fs.rmSync(gitPath, { recursive: true, force: true });
                 }
 
-                // Step 4: Install dependencies if requested
-                let installOutput = "";
-                let installed = false;
-                if (installDeps) {
+                // Step 4: Keep only the requested apps. Older refs (e.g. v1.0.0) use a
+                // flat backend-only layout with no app folders at all.
+                const isMonorepo = APPS.some((app) => fs.existsSync(path.join(projectRoot, app)));
+                let appDirs: { app: App; dir: string }[];
+
+                if (isMonorepo) {
+                    const missing = apps.filter((app) => !fs.existsSync(path.join(projectRoot, app)));
+                    if (missing.length > 0) {
+                        throw new Error(
+                            `Branch "${branch}" of the boilerplate has no ${missing.join(", ")} app. ` +
+                            `Available: ${APPS.filter((app) => fs.existsSync(path.join(projectRoot, app))).join(", ")}.`
+                        );
+                    }
+                    for (const app of APPS) {
+                        if (!apps.includes(app)) {
+                            fs.rmSync(path.join(projectRoot, app), { recursive: true, force: true });
+                        }
+                    }
+                    // Root docker-compose.yml only orchestrates backend + Postgres.
+                    if (!apps.includes("backend")) {
+                        for (const file of ["docker-compose.yml", ".env.example"]) {
+                            fs.rmSync(path.join(projectRoot, file), { force: true });
+                        }
+                    }
+                    appDirs = apps.map((app) => ({ app, dir: path.join(projectRoot, app) }));
+                } else {
+                    if (apps.some((app) => app !== "backend")) {
+                        throw new Error(
+                            `Branch "${branch}" of the boilerplate is backend-only (flat layout). ` +
+                            `Use branch "main" to include frontend/admin.`
+                        );
+                    }
+                    appDirs = [{ app: "backend", dir: projectRoot }];
+                }
+
+                // Step 5: Per-app install, then Prisma generate + tsc for the backend
+                // and tsc for the Next.js apps.
+                const notes: string[] = [];
+                for (const { app, dir } of appDirs) {
+                    if (!installDeps) continue;
+
                     try {
-                        await execFileAsync("npm", ["install"], { cwd: projectRoot, timeout: 60000 });
-                        installOutput = `\n[SUCCESS] NPM dependencies installed successfully.`;
-                        installed = true;
+                        await execFileAsync("npm", ["install"], { cwd: dir, timeout: 300000 });
+                        notes.push(`[SUCCESS] ${app}: npm dependencies installed.`);
                     } catch (err: unknown) {
                         const errorMessage = err instanceof Error ? err.message : String(err);
-                        installOutput = `\n[WARNING] NPM installation failed. Run \`npm install\` manually. Error: ${errorMessage}`;
+                        notes.push(`[WARNING] ${app}: npm install failed. Run \`npm install\` in ${dir} manually. Error: ${errorMessage}`);
                         report.status = "PARTIAL_FAILURE";
+                        continue;
                     }
-                }
 
-                // Step 5: Post-Clone Stability Improvements (npx prisma generate + tsc --noEmit)
-                let prismaOutput = "";
-                if (installed) {
-                    try {
-                        await execFileAsync("npx", ["prisma", "generate"], { cwd: projectRoot, timeout: 30000 });
-                        prismaOutput = `\n[SUCCESS] Prisma client generated automatically.`;
-
+                    if (app === "backend") {
+                        // prisma.config.ts resolves DATABASE_URL on load, but generate never
+                        // connects — a placeholder lets it run before the user has a .env
+                        // (same trick as the boilerplate's Dockerfile build stage).
                         try {
-                            await execFileAsync("npx", ["tsc", "--noEmit"], { cwd: projectRoot, timeout: 30000 });
-                            prismaOutput += `\n[SUCCESS] TypeScript validation passed.`;
-                        } catch (tscErr: unknown) {
-                            prismaOutput += `\n[WARNING] TypeScript validation failed. You may need to fix type errors manually.`;
+                            await execFileAsync("npx", ["prisma", "generate"], {
+                                cwd: dir,
+                                timeout: 60000,
+                                env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL ?? PLACEHOLDER_DATABASE_URL },
+                            });
+                            notes.push(`[SUCCESS] ${app}: Prisma client generated.`);
+                        } catch {
+                            notes.push(`[WARNING] ${app}: Prisma generate failed. Run \`npx prisma generate\` in ${dir} manually.`);
                             report.status = "PARTIAL_FAILURE";
+                            continue;
                         }
-                    } catch (err: unknown) {
-                        prismaOutput = `\n[WARNING] Prisma generate failed. Ensure your .env is correctly configured with DATABASE_URL and run \`npx prisma generate\` manually.`;
+                    } else {
+                        // Next.js declares global route types (LayoutProps, PageProps)
+                        // only after typegen; tsc fails on a fresh clone without them.
+                        try {
+                            await execFileAsync("npx", ["next", "typegen"], { cwd: dir, timeout: 60000 });
+                        } catch {
+                            // tsc below will surface the problem
+                        }
+                    }
+
+                    try {
+                        await execFileAsync("npx", ["tsc", "--noEmit"], { cwd: dir, timeout: 60000 });
+                        notes.push(`[SUCCESS] ${app}: TypeScript validation passed.`);
+                    } catch {
+                        notes.push(`[WARNING] ${app}: TypeScript validation failed. You may need to fix type errors manually.`);
                         report.status = "PARTIAL_FAILURE";
                     }
                 }
 
-                report.humanMessage = `[SUCCESS] Project "${projectName}" scaffolded successfully at ${projectRoot} using Kunal's backend-boilerplate.${installOutput}${prismaOutput}\n\nNext steps:\n  1. cd ${projectRoot}\n  2. Add your DATABASE_URL to the .env file\n  3. Run your Prisma migrations`;
+                const cdInto = (dir: string) => {
+                    const rel = path.relative(projectRoot, dir);
+                    return rel ? `cd ${rel} && ` : "";
+                };
+                const nextSteps: string[] = [];
+                for (const { app, dir } of appDirs) {
+                    if (app === "backend") {
+                        nextSteps.push(`${cdInto(dir)}cp .env.example .env, then set DATABASE_URL and JWT_ACCESS_SECRET`);
+                        nextSteps.push(`${cdInto(dir)}npx prisma migrate dev` +
+                                (fs.existsSync(path.join(projectRoot, "docker-compose.yml"))
+                                    ? ` (or \`docker compose up --build\` from the project root)`
+                                    : ""));
+                    } else {
+                        nextSteps.push(`${cdInto(dir)}cp .env.local.example .env.local, then point NEXT_PUBLIC_API_URL at the backend`);
+                    }
+                }
+
+                report.humanMessage =
+                    `[SUCCESS] Project "${projectName}" scaffolded at ${projectRoot} with: ${apps.join(", ")} (branch "${branch}").` +
+                    (notes.length ? `\n${notes.join("\n")}` : "") +
+                    `\n\nNext steps (from ${projectRoot}):\n` +
+                    nextSteps.map((step, i) => `  ${i + 1}. ${step}`).join("\n");
             } catch (err: unknown) {
                 // Clean up a directory we created ourselves so a failed clone/install
                 // doesn't leave debris blocking retries under the same projectName.

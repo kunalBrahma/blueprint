@@ -239,21 +239,23 @@ Blueprint Architect exposes **20 tools**, organized by domain. Each tool accepts
 
 ### 1. `scaffold_project`
 
-**Purpose:** Bootstrap a new backend project from a production-ready boilerplate.
+**Purpose:** Bootstrap a new project from the production-ready boilerplate — backend only, or the full stack.
 
 **What it does:**
-- Clones the standard backend boilerplate repository into the specified directory
-- Removes `.git` history so the new project starts fresh
-- Optionally runs `npm install` to resolve all dependencies
+- Clones the boilerplate monorepo into `<outputDir>/<projectName>` and removes `.git` history so the project starts fresh
+- Keeps only the apps you select (`backend/`, `frontend/`, `admin/`); the root `docker-compose.yml` is kept only when `backend` is included
+- Optionally installs dependencies per app, runs `prisma generate` for the backend and `next typegen` for the Next.js apps, then type-checks each one
 
 **Parameters:**
 | Name | Type | Required | Description |
 |---|---|---|---|
 | `projectName` | string | Yes | Name of the project to scaffold |
 | `outputDir` | string | Yes | Absolute path to the directory where the project should be created |
+| `apps` | (`"backend"` \| `"frontend"` \| `"admin"`)[] | No | Apps to include (default: `["backend"]`). Pass all three for the full stack |
+| `branch` | string | No | Boilerplate branch or tag to clone (default: `main`). Legacy flat refs like `v1.0.0` support `backend` only |
 | `installDeps` | boolean | No | Whether to install npm dependencies after cloning (default: `true`) |
 
-**Use case:** Starting a new Express + Prisma + TypeScript backend from scratch without manual boilerplate setup.
+**Use case:** Starting a new Express + Prisma + TypeScript backend, optionally with Next.js public and admin apps, without manual boilerplate setup.
 
 **Mutation footprint:** Creates the entire project directory tree.
 
