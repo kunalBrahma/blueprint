@@ -7,12 +7,7 @@ function resolveWorkspaceRoot(): string {
     if (envRoot && envRoot.trim() !== '') {
         return path.resolve(envRoot);
     }
-
-    throw new Error(
-        "[FATAL] MCP_WORKSPACE_ROOT is not set. " +
-        "Blueprint MCP requires an explicit workspace root. " +
-        "Set it via: export MCP_WORKSPACE_ROOT=/path/to/your/project"
-    );
+    return process.cwd();
 }
 
 /**

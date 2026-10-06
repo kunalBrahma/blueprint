@@ -23,7 +23,8 @@ export function enforcePathJail(
     const resolvedTarget = path.resolve(workspaceRoot, requestedPath);
     const resolvedRoot = path.resolve(workspaceRoot);
 
-    if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(resolvedRoot + path.sep)) {
+    const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : resolvedRoot + path.sep;
+    if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(rootPrefix)) {
         throw new Error(
             `[PathJail] Path traversal blocked.\n` +
             `  Workspace: ${resolvedRoot}\n` +
@@ -39,7 +40,8 @@ export function enforcePathJail(
         const realPath = fs.realpathSync(resolvedTarget);
         const realRoot = fs.realpathSync(resolvedRoot);
 
-        if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
+        const realPrefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+        if (realPath !== realRoot && !realPath.startsWith(realPrefix)) {
             throw new Error(
                 `[PathJail] Symlink escape blocked.\n` +
                 `  Workspace: ${realRoot}\n` +
@@ -55,7 +57,8 @@ export function enforcePathJail(
             if (fs.existsSync(ancestor)) {
                 const realAncestor = fs.realpathSync(ancestor);
                 const realRoot = fs.realpathSync(resolvedRoot);
-                if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) {
+                const realPrefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+                if (realAncestor !== realRoot && !realAncestor.startsWith(realPrefix)) {
                     throw new Error(
                         `[PathJail] Ancestor symlink escape blocked.\n` +
                         `  Workspace:       ${realRoot}\n` +
